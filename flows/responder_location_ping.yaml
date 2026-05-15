@@ -1,0 +1,77 @@
+id: responder_location_ping
+namespace: sentinel.grid
+description: "Kestra-owned responder live-location heartbeat. Updates SQLite and the UI helper snapshot from responder browser geolocation."
+
+variables:
+  db_path: "/workspace/sentinel-grid/database/sentinel.db"
+  ui_snapshot_path: "/workspace/sentinel-grid/frontend/public/sentinel-helpers.json"
+
+triggers:
+  - id: location-ping
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: location-ping
+    wait: false
+
+tasks:
+  - id: persist_responder_location
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      payload.json: "{{ trigger.body }}"
+    script: |
+      import json, pathlib, sqlite3
+      from datetime import datetime, timezone
+
+      payload = json.loads(pathlib.Path("payload.json").read_text())
+      responder_id = (payload.get("responder_id") or "").strip()
+      location = payload.get("location") or {}
+      if not responder_id:
+          raise ValueError("responder_id is required")
+      lat = float(location["lat"])
+      lon = float(location["lon"])
+      accuracy_m = location.get("accuracy_m")
+      now = datetime.now(timezone.utc).isoformat()
+      db_path = "{{ vars.db_path }}"
+      snapshot_path = pathlib.Path("{{ vars.ui_snapshot_path }}")
+      conn = sqlite3.connect(db_path)
+      existing = {row[1] for row in conn.execute("PRAGMA table_info(responders)")}
+      migrations = {
+          "verification_source": "ALTER TABLE responders ADD COLUMN verification_source TEXT",
+          "location_updated_at": "ALTER TABLE responders ADD COLUMN location_updated_at TEXT",
+          "last_execution_id": "ALTER TABLE responders ADD COLUMN last_execution_id TEXT",
+          "last_location_accuracy_m": "ALTER TABLE responders ADD COLUMN last_location_accuracy_m REAL",
+      }
+      for column, statement in migrations.items():
+          if column not in existing:
+              conn.execute(statement)
+      conn.execute(
+          """
+          UPDATE responders
+          SET latitude = ?, longitude = ?, location_updated_at = ?, last_execution_id = ?, last_location_accuracy_m = ?, active = 1
+          WHERE id = ?
+          """,
+          (lat, lon, now, payload.get("execution_id") or "", accuracy_m, responder_id),
+      )
+      if conn.total_changes == 0:
+          raise ValueError(f"unknown responder_id {responder_id}")
+      conn.row_factory = sqlite3.Row
+      rows = conn.execute(
+          """
+          SELECT id, telegram_chat_id, display_name, phone, email, github, photo_url,
+                 latitude, longitude, active, verification_status, cybercrime_status,
+                 cybercrime_checked_at, blacklist_reason, verification_source, location_updated_at,
+                 last_execution_id, last_location_accuracy_m
+          FROM responders
+          ORDER BY active DESC, display_name COLLATE NOCASE
+          """
+      ).fetchall()
+      snapshot = {
+          "source": db_path,
+          "generated_at": now,
+          "helpers": [dict(row) for row in rows],
+      }
+      snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+      snapshot_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+      conn.commit()
+      print(f"::{json.dumps({'outputs': {'location_saved': True, 'responder_id': responder_id, 'latitude': lat, 'longitude': lon, 'location_updated_at': now, 'snapshot_helpers': len(snapshot['helpers']), 'execution_id': payload.get('execution_id') or ''}}, separators=(',', ':'))}::")

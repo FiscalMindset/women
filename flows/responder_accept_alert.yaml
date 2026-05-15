@@ -1,0 +1,85 @@
+id: responder_accept_alert
+namespace: sentinel.grid
+description: "Kestra-owned responder acceptance heartbeat. Persists alert acceptance so victim and responder browsers see the same accepted state."
+
+variables:
+  db_path: "/workspace/sentinel-grid/database/sentinel.db"
+  ui_snapshot_path: "/workspace/sentinel-grid/frontend/public/sentinel-acceptances.json"
+
+triggers:
+  - id: accept-alert
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: accept-alert
+    wait: false
+
+tasks:
+  - id: persist_acceptance
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      payload.json: "{{ trigger.body }}"
+    script: |
+      import json, pathlib, sqlite3
+      from datetime import datetime, timezone
+
+      payload = json.loads(pathlib.Path("payload.json").read_text())
+      execution_id = (payload.get("execution_id") or "").strip()
+      responder_id = (payload.get("responder_id") or "").strip()
+      if not execution_id or not responder_id:
+          raise ValueError("execution_id and responder_id are required")
+      accepted_at = payload.get("accepted_at") or datetime.now(timezone.utc).isoformat()
+      location = payload.get("location") or {}
+      lat = location.get("lat")
+      lon = location.get("lon")
+      db_path = "{{ vars.db_path }}"
+      snapshot_path = pathlib.Path("{{ vars.ui_snapshot_path }}")
+      conn = sqlite3.connect(db_path)
+      conn.execute(
+          """
+          CREATE TABLE IF NOT EXISTS responder_acceptances (
+            execution_id TEXT NOT NULL,
+            responder_id TEXT NOT NULL,
+            responder_name TEXT,
+            accepted_at TEXT NOT NULL,
+            latitude REAL,
+            longitude REAL,
+            PRIMARY KEY (execution_id, responder_id)
+          )
+          """
+      )
+      conn.execute(
+          """
+          INSERT INTO responder_acceptances (execution_id, responder_id, responder_name, accepted_at, latitude, longitude)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(execution_id, responder_id) DO UPDATE SET
+            responder_name=excluded.responder_name,
+            accepted_at=excluded.accepted_at,
+            latitude=excluded.latitude,
+            longitude=excluded.longitude
+          """,
+          (execution_id, responder_id, payload.get("responder_name") or responder_id, accepted_at, lat, lon),
+      )
+      conn.commit()
+      conn.row_factory = sqlite3.Row
+      rows = conn.execute(
+          """
+          SELECT execution_id, responder_id, responder_name, accepted_at, latitude, longitude
+          FROM responder_acceptances
+          ORDER BY accepted_at DESC
+          LIMIT 100
+          """
+      ).fetchall()
+      acceptances = {}
+      for row in rows:
+          acceptances[f"sentinel-acceptance:{row['execution_id']}:{row['responder_id']}"] = row["accepted_at"]
+          acceptances[f"sentinel-acceptance:{row['execution_id']}:accepted"] = row["accepted_at"]
+      snapshot = {
+          "source": db_path,
+          "generated_at": datetime.now(timezone.utc).isoformat(),
+          "acceptances": acceptances,
+          "events": [dict(row) for row in rows],
+      }
+      snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+      snapshot_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+      print(f"::{json.dumps({'outputs': {'accepted': True, 'execution_id': execution_id, 'responder_id': responder_id, 'accepted_at': accepted_at, 'snapshot_acceptances': len(acceptances)}}, separators=(',', ':'))}::")

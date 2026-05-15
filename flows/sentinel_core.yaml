@@ -1,0 +1,612 @@
+id: sentinel_core
+namespace: sentinel.grid
+description: "Realtime Sentinel Grid tactical command surface: webhook audio/GPS intake, Edge TPU validation, SQLite-backed responder integrity, cybercrime suspect checks, analytics logging, and report drafting."
+
+variables:
+  responder_radius_km: 15
+  min_distress_confidence: 0.82
+  fallback_chat_id: "0"
+  dev_mode: true
+  db_path: "/workspace/sentinel-grid/database/sentinel.db"
+  cybercrime_auto_submit: false
+  cybercrime_portal_suspect_search_url: "https://cybercrime.gov.in/Webform/suspect_search_repository.aspx"
+  cybercrime_portal_report_url: "https://cybercrime.gov.in/Webform/Crime_ReportAnonymously.aspx"
+  coral_enabled: false
+  frontend_base_url: "http://127.0.0.1:5173"
+
+triggers:
+  - id: realtime_intake
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: sentinel-grid-intake
+    wait: false
+
+tasks:
+  - id: normalize_payload
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      payload.json: "{{ trigger.body }}"
+    script: |
+      import base64, hashlib, io, json, pathlib, time, wave
+
+      raw = json.loads(pathlib.Path("payload.json").read_text())
+      audio_b64 = raw.get("audio_b64") or ""
+      audio = base64.b64decode(audio_b64, validate=True) if audio_b64 else b""
+      if not audio:
+          raise ValueError("audio_b64 is required")
+      audio_seconds = 0.0
+      try:
+          with wave.open(io.BytesIO(audio), "rb") as wav:
+              rate = wav.getframerate() or 16000
+              audio_seconds = round(wav.getnframes() / float(rate), 2)
+      except Exception:
+          audio_seconds = 0.0
+
+      gps = raw.get("gps") or {}
+      lat, lon = float(gps["lat"]), float(gps["lon"])
+      suspect = raw.get("suspect") or {}
+      victim = raw.get("victim") or {}
+      image_b64 = raw.get("image_b64") or ""
+      image_mime = raw.get("image_mime") or "image/jpeg"
+      client_context = raw.get("client_context") or {}
+      headers = {{ trigger.headers ?? {} }}
+      client_ip_guess = ""
+      for key in ("X-Forwarded-For", "x-forwarded-for", "X-Real-IP", "x-real-ip"):
+          value = headers.get(key)
+          if isinstance(value, list) and value:
+              client_ip_guess = str(value[0]).split(",")[0].strip()
+              break
+          if isinstance(value, str) and value:
+              client_ip_guess = value.split(",")[0].strip()
+              break
+      out = {
+          "event_id": raw.get("event_id") or hashlib.sha256(audio + str(time.time_ns()).encode()).hexdigest()[:24],
+          "audio_b64": audio_b64,
+          "audio_sha256": hashlib.sha256(audio).hexdigest(),
+          "image_b64": image_b64,
+          "image_mime": image_mime if image_b64 else None,
+          "preferred_responder_id": raw.get("preferred_responder_id") or "",
+          "gps": {"lat": lat, "lon": lon, "accuracy_m": gps.get("accuracy_m")},
+          "suspect": suspect,
+          "person_in_danger": {
+              "role": victim.get("role") or "person_in_danger",
+              "consent": victim.get("consent") or "emergency_button_pressed",
+              "profile": victim.get("profile") or {},
+          },
+          "client_context": client_context,
+          "client_ip_guess": client_ip_guess,
+          "source": raw.get("source") or "unknown",
+          "received_at_epoch_ms": int(time.time() * 1000),
+      }
+      payload_json = json.dumps(out, separators=(",", ":"))
+      image_data_url = f"{image_mime};base64,{image_b64}"
+      if image_b64:
+          image_data_url = f"data:{image_mime};base64,{image_b64}"
+      print(f"::{json.dumps({'outputs': {'payload_json': payload_json, 'event_id': out['event_id'], 'audio_sha256': out['audio_sha256'], 'audio_data_url': 'data:audio/wav;base64,' + audio_b64, 'audio_mime': 'audio/wav', 'audio_seconds': audio_seconds, 'image_data_url': image_data_url if image_b64 else '', 'image_mime': image_mime if image_b64 else ''}}, separators=(',', ':'))}::")
+
+  - id: ensure_responder_integrity_schema
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    script: |
+      import json, sqlite3
+      db_path = "{{ vars.db_path }}"
+      conn = sqlite3.connect(db_path)
+      existing = {row[1] for row in conn.execute("PRAGMA table_info(responders)")}
+      migrations = {
+          "verification_status": "ALTER TABLE responders ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'",
+          "cybercrime_status": "ALTER TABLE responders ADD COLUMN cybercrime_status TEXT NOT NULL DEFAULT 'unchecked'",
+          "cybercrime_checked_at": "ALTER TABLE responders ADD COLUMN cybercrime_checked_at TEXT",
+          "blacklist_reason": "ALTER TABLE responders ADD COLUMN blacklist_reason TEXT",
+          "verification_source": "ALTER TABLE responders ADD COLUMN verification_source TEXT",
+          "location_updated_at": "ALTER TABLE responders ADD COLUMN location_updated_at TEXT",
+          "last_execution_id": "ALTER TABLE responders ADD COLUMN last_execution_id TEXT",
+          "last_location_accuracy_m": "ALTER TABLE responders ADD COLUMN last_location_accuracy_m REAL",
+      }
+      applied = []
+      for column, statement in migrations.items():
+          if column not in existing:
+              conn.execute(statement)
+              applied.append(column)
+      conn.commit()
+      print(f"::{json.dumps({'outputs': {'db_path': db_path, 'applied_columns': applied, 'schema_ready': True}}, separators=(',', ':'))}::")
+
+  - id: verify_distress_edge_tpu
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      SENTINEL_MODEL_PATH: "{{ vars.edge_tpu_model_path ?? '/opt/sentinel/models/distress_edgetpu.tflite' }}"
+      SENTINEL_LABELS_PATH: "{{ vars.edge_tpu_labels_path ?? '/opt/sentinel/models/distress_labels.txt' }}"
+      SENTINEL_MIN_CONFIDENCE: "{{ vars.min_distress_confidence }}"
+      SENTINEL_DEV_MODE: "{{ vars.dev_mode }}"
+    inputFiles:
+      payload.json: "{{ outputs.normalize_payload.vars.payload_json }}"
+    script: |
+      import base64, importlib.util, json, math, os, pathlib, platform, shutil, struct, subprocess, sys, tempfile, uuid, urllib.request, wave
+
+      def hardware_probe():
+          usb = ""
+          if shutil.which("lsusb"):
+              usb = subprocess.run(["lsusb"], check=False, capture_output=True, text=True).stdout
+          return {
+              "platform": platform.platform(),
+              "machine": platform.machine(),
+              "pycoral": importlib.util.find_spec("pycoral") is not None,
+              "tflite_runtime": importlib.util.find_spec("tflite_runtime") is not None,
+              "edge_tpu_usb_hint": any(token in usb.lower() for token in ("coral", "google", "global unichip", "1a6e")),
+          }
+
+      payload = json.loads(pathlib.Path("payload.json").read_text())
+      audio = base64.b64decode(payload["audio_b64"])
+      env_sound = "unknown"
+      transcript = "Speech transcription unavailable in local dev mode; raw audio evidence is attached for operator review."
+      transcript_source = "local_dev_fallback"
+      def groq_transcribe(audio_bytes):
+          api_key = os.getenv("GROQ_API_KEY") or ""
+          if not api_key:
+              return None, "groq_key_missing"
+          boundary = "----sentinel-" + uuid.uuid4().hex
+          head = (
+              f"--{boundary}\r\n"
+              'Content-Disposition: form-data; name="model"\r\n\r\n'
+              "whisper-large-v3-turbo\r\n"
+              f"--{boundary}\r\n"
+              'Content-Disposition: form-data; name="file"; filename="evidence.wav"\r\n'
+              "Content-Type: audio/wav\r\n\r\n"
+          ).encode()
+          tail = f"\r\n--{boundary}--\r\n".encode()
+          request = urllib.request.Request(
+              "https://api.groq.com/openai/v1/audio/transcriptions",
+              data=head + audio_bytes + tail,
+              headers={"Authorization": f"Bearer {api_key}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=35) as response:
+                  body = json.loads(response.read().decode("utf-8", errors="replace"))
+              return body.get("text") or "", "groq_whisper_large_v3_turbo"
+          except Exception as exc:
+              return None, f"groq_failed:{exc}"
+      groq_text, groq_source = groq_transcribe(audio)
+      if groq_text:
+          transcript = groq_text
+          transcript_source = groq_source
+      else:
+          transcript_source = groq_source
+      try:
+          import io
+          with wave.open(io.BytesIO(audio), "rb") as wav:
+              frames = wav.readframes(wav.getnframes())
+              if wav.getsampwidth() == 2 and frames:
+                  samples = struct.unpack("<" + "h" * (len(frames) // 2), frames)
+                  rms = math.sqrt(sum(sample * sample for sample in samples) / max(len(samples), 1)) / 32768.0
+                  peak = max(abs(sample) for sample in samples) / 32768.0
+                  if rms < 0.015:
+                      env_sound = "low ambient / possible silence"
+                  elif peak > 0.75:
+                      env_sound = "loud sharp sound / possible shout or impact"
+                  elif rms > 0.12:
+                      env_sound = "high ambient distress noise"
+                  else:
+                      env_sound = "human voice or street ambience likely"
+      except Exception as exc:
+          env_sound = f"audio analysis pending: {exc}"
+      probe = hardware_probe()
+      hardware_status = "ACTIVE" if probe["pycoral"] and probe["edge_tpu_usb_hint"] else "CPU_FALLBACK"
+      if os.getenv("SENTINEL_DEV_MODE", "false").lower() == "true":
+          result = {
+              "distress": True,
+              "label": "dev_verified_distress",
+              "confidence": 0.98,
+              "accelerator": "mock-local",
+              "hardware_status": hardware_status,
+              "hardware_probe": probe,
+              "latency_ms": 0.0,
+              "audio_ai": "98% Distress",
+              "environment_sound": env_sound,
+              "transcript": transcript,
+              "transcript_source": transcript_source,
+          }
+          print(f"::{json.dumps({'outputs': {'distress_json': json.dumps(result, separators=(',', ':')), 'distress': True, 'confidence': 0.98, 'label': 'dev_verified_distress', 'accelerator': 'mock-local', 'hardware_status': hardware_status, 'audio_ai': '98% Distress', 'environment_sound': env_sound, 'transcript': transcript, 'transcript_source': transcript_source}}, separators=(',', ':'))}::")
+          raise SystemExit(0)
+
+      with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+          fh.write(audio)
+          audio_path = fh.name
+      cmd = [
+          sys.executable,
+          "/workspace/sentinel-grid/services/ai-edge/distress_classifier.py",
+          "--audio", audio_path,
+          "--model", os.environ["SENTINEL_MODEL_PATH"],
+          "--labels", os.environ["SENTINEL_LABELS_PATH"],
+          "--min-confidence", os.environ["SENTINEL_MIN_CONFIDENCE"],
+      ]
+      completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+      result = json.loads(completed.stdout)
+      result["hardware_status"] = "ACTIVE" if result.get("accelerator") == "coral-edge-tpu" else "CPU_FALLBACK"
+      result["hardware_probe"] = probe
+      result["audio_ai"] = f"{float(result.get('confidence', 0.0)) * 100:.0f}% {result.get('label', 'unknown')}"
+      result["environment_sound"] = env_sound
+      result["transcript"] = transcript
+      result["transcript_source"] = transcript_source
+      print(f"::{json.dumps({'outputs': {'distress_json': json.dumps(result, separators=(',', ':')), 'distress': bool(result.get('distress')), 'confidence': float(result.get('confidence', 0.0)), 'label': str(result.get('label', 'unknown')), 'accelerator': str(result.get('accelerator', 'unknown')), 'hardware_status': result['hardware_status'], 'audio_ai': result['audio_ai'], 'environment_sound': env_sound, 'transcript': transcript, 'transcript_source': transcript_source}}, separators=(',', ':'))}::")
+
+  - id: nearest_helpers_by_radius
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      payload.json: "{{ outputs.normalize_payload.vars.payload_json }}"
+    script: |
+      import json, math, pathlib, sqlite3
+
+      payload = json.loads(pathlib.Path("payload.json").read_text())
+      lat = float(payload["gps"]["lat"])
+      lon = float(payload["gps"]["lon"])
+      preferred_responder_id = (payload.get("preferred_responder_id") or "").strip()
+      radius_km = float("{{ vars.responder_radius_km }}")
+      frontend_base_url = "{{ vars.frontend_base_url }}"
+      execution_id = "{{ execution.id }}"
+      conn = sqlite3.connect("{{ vars.db_path }}")
+      conn.row_factory = sqlite3.Row
+      helpers = []
+      for row in conn.execute(
+          """
+          SELECT id, telegram_chat_id, display_name, phone, email, github, photo_url, latitude, longitude,
+                 active, verification_status, cybercrime_status, cybercrime_checked_at, blacklist_reason,
+                 verification_source, location_updated_at, last_execution_id, last_location_accuracy_m
+          FROM responders
+          WHERE active = 1 AND COALESCE(cybercrime_status, 'unchecked') != 'flagged'
+          """
+      ):
+          lat2 = float(row["latitude"])
+          lon2 = float(row["longitude"])
+          d_lat = math.radians(lat2 - lat)
+          d_lon = math.radians(lon2 - lon)
+          a = math.sin(d_lat / 2) ** 2 + math.cos(math.radians(lat)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
+          distance_km = 6371.0 * 2.0 * math.asin(math.sqrt(a))
+          if distance_km <= radius_km:
+              item = dict(row)
+              item["distance_km"] = round(distance_km, 4)
+              item["name"] = item.pop("display_name")
+              item["responder_console_url"] = f"{frontend_base_url}/?responder={item['id']}&execution={execution_id}"
+              helpers.append(item)
+      helpers.sort(key=lambda item: item["distance_km"])
+      selection_mode = "auto_nearest"
+      if preferred_responder_id:
+          preferred = [item for item in helpers if item["id"] == preferred_responder_id]
+          if preferred:
+              helpers = preferred
+              selection_mode = "manual_selected_responder"
+      helpers = helpers[:25]
+      print(f"::{json.dumps({'outputs': {'rows': helpers, 'helper_count': len(helpers), 'source': 'sqlite-sentinel-db', 'selection_mode': selection_mode, 'preferred_responder_id': preferred_responder_id or ''}}, separators=(',', ':'))}::")
+
+  - id: route_verified_or_drop
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.verify_distress_edge_tpu.vars.distress == true }}"
+    then:
+      - id: verify_responder_security
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          PLAYWRIGHT_HEADLESS: "true"
+          GOV_PORTAL_OPERATOR_TIMEOUT_MS: "{{ vars.gov_portal_operator_timeout_ms ?? 120000 }}"
+          SUSPECT_SEARCH_URL: "{{ vars.cybercrime_portal_suspect_search_url }}"
+          SENTINEL_DEV_MODE: "{{ vars.dev_mode }}"
+          FRONTEND_BASE_URL: "{{ vars.frontend_base_url }}"
+        inputFiles:
+          helpers.json: "{{ outputs.nearest_helpers_by_radius.vars.rows }}"
+        script: |
+          import asyncio, json, os, re, sqlite3
+          from datetime import datetime, timezone
+
+          helpers = json.loads(open("helpers.json").read())
+          portal_url = os.getenv("SUSPECT_SEARCH_URL")
+          timeout_ms = int(os.getenv("GOV_PORTAL_OPERATOR_TIMEOUT_MS", "120000"))
+          db_path = "{{ vars.db_path }}"
+          execution_id = "{{ execution.id }}"
+          frontend_base_url = os.getenv("FRONTEND_BASE_URL", "http://127.0.0.1:5173")
+          identifier_order = (("mobile", "phone"), ("email", "email"), ("upi", "upi"), ("bank_account", "bank_account"), ("social_media", "github"))
+
+          if os.getenv("SENTINEL_DEV_MODE", "false").lower() == "true":
+              now = datetime.now(timezone.utc).isoformat()
+              conn = sqlite3.connect(db_path)
+              checked = []
+              for helper in helpers:
+                  helper = {
+                      **helper,
+                      "verification_status": "verified",
+                      "cybercrime_status": "clear",
+                      "cybercrime_checked_at": now,
+                      "verification_source": "kestra_verify_responder_security_dev_portal_simulation",
+                      "responder_console_url": f"{frontend_base_url}/?responder={helper['id']}&execution={execution_id}",
+                      "cybercrime_checks": [{"status": "clear", "source": "kestra-dev-mode", "portal": portal_url, "reason": "dev_mode avoids captcha but still runs Kestra verification node before dispatch", "identifiers_checked": [field for _, field in identifier_order if helper.get(field)]}],
+                  }
+                  conn.execute(
+                      "UPDATE responders SET active = 1, verification_status = 'verified', cybercrime_status = 'clear', cybercrime_checked_at = ?, verification_source = ?, blacklist_reason = NULL WHERE id = ?",
+                      (now, helper["verification_source"], helper["id"]),
+                  )
+                  checked.append(helper)
+              conn.commit()
+              print(f"::{json.dumps({'outputs': {'checked_helpers': checked, 'nearest_helpers': checked, 'blacklisted_count': 0, 'cybercrime_check': 'CLEAR', 'verification_mode': 'kestra_dev_mode_cybercrime_auto_check', 'portal_url': portal_url}}, separators=(',', ':'))}::")
+              raise SystemExit(0)
+
+          from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
+
+          async def check_identifier(page, identifier_type, value):
+              if not value:
+                  return {"status": "skipped", "reason": "missing_identifier"}
+              await page.goto(portal_url, wait_until="domcontentloaded", timeout=60000)
+              select = page.locator("select").first
+              if await select.count():
+                  labels = {"mobile": "Mobile", "email": "E-mail", "bank_account": "Bank Account", "social_media": "Social Media", "upi": "UPI"}
+                  await select.select_option(label=labels.get(identifier_type, identifier_type))
+              textbox = page.get_by_role("textbox").first
+              if not await textbox.count():
+                  return {"status": "operator_required", "reason": "identifier_textbox_missing"}
+              await textbox.fill(str(value))
+              captcha = page.locator("input[id*='captcha' i], input[name*='captcha' i]").first
+              if await captcha.count():
+                  return {"status": "operator_required", "reason": "captcha_present"}
+              button = page.get_by_role("button", name=re.compile("search", re.IGNORECASE)).first
+              if not await button.count():
+                  return {"status": "operator_required", "reason": "search_button_missing"}
+              await button.click()
+              try:
+                  await page.locator("table, .result, #result").first.wait_for(timeout=timeout_ms)
+              except PlaywrightTimeoutError:
+                  return {"status": "unknown", "reason": "result_timeout"}
+              body_text = await page.locator("body").inner_text(timeout=10000)
+              normalized = body_text.lower()
+              status = "clear" if "no record" in normalized or "not found" in normalized or "no records" in normalized else "flagged"
+              return {"status": status, "identifier_type": identifier_type, "identifier": str(value), "details": body_text[-1200:]}
+
+          async def main():
+              async with async_playwright() as pw:
+                  browser = await pw.chromium.launch(headless=os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true")
+                  context = await browser.new_context(locale="en-IN", timezone_id="Asia/Kolkata")
+                  page = await context.new_page()
+                  results = []
+                  for helper in helpers:
+                      checks = []
+                      final_status = "clear"
+                      for identifier_type, field in identifier_order:
+                          value = helper.get(field)
+                          if not value:
+                              continue
+                          check = await check_identifier(page, identifier_type, value)
+                          checks.append(check)
+                          if check.get("status") == "flagged":
+                              final_status = "flagged"
+                              break
+                          if check.get("status") in ("operator_required", "unknown") and final_status != "flagged":
+                              final_status = check["status"]
+                      results.append({**helper, "verification_status": "verified" if final_status == "clear" else "unverified", "cybercrime_status": final_status, "verification_source": "kestra_playwright_cybercrime_portal", "cybercrime_checks": checks})
+                  await browser.close()
+                  return results
+
+          checked = asyncio.run(main())
+          now = datetime.now(timezone.utc).isoformat()
+          conn = sqlite3.connect(db_path)
+          for helper in checked:
+              if helper["cybercrime_status"] == "flagged":
+                  conn.execute(
+                      "UPDATE responders SET active = 0, verification_status = 'unverified', cybercrime_status = 'flagged', cybercrime_checked_at = ?, verification_source = ?, blacklist_reason = ? WHERE id = ?",
+                      (now, helper.get("verification_source"), "Cybercrime suspect repository match", helper["id"]),
+                  )
+              elif helper["cybercrime_status"] == "clear":
+                  conn.execute(
+                      "UPDATE responders SET verification_status = 'verified', cybercrime_status = 'clear', cybercrime_checked_at = ?, verification_source = ?, blacklist_reason = NULL WHERE id = ?",
+                      (now, helper.get("verification_source"), helper["id"]),
+                  )
+          conn.commit()
+          safe_helpers = [{**helper, "responder_console_url": f"{frontend_base_url}/?responder={helper['id']}&execution={execution_id}"} for helper in checked if helper["cybercrime_status"] != "flagged"]
+          print(f"::{json.dumps({'outputs': {'checked_helpers': checked, 'nearest_helpers': safe_helpers, 'blacklisted_count': len(checked) - len(safe_helpers), 'cybercrime_check': 'CLEAR' if len(checked) == len(safe_helpers) else 'FLAGGED'}}, separators=(',', ':'))}::")
+
+      - id: persist_incident_analytics
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        inputFiles:
+          payload.json: "{{ outputs.normalize_payload.vars.payload_json }}"
+        script: |
+          import json, pathlib, sqlite3
+          payload = json.loads(pathlib.Path("payload.json").read_text())
+          gps = payload["gps"]
+          area_key = f"delhi:{round(float(gps['lat']), 2)}:{round(float(gps['lon']), 2)}"
+          conn = sqlite3.connect("{{ vars.db_path }}")
+          conn.execute("CREATE TABLE IF NOT EXISTS incident_analytics (event_id TEXT PRIMARY KEY, area_key TEXT, distress_confidence REAL, hardware_status TEXT, created_at_epoch_ms INTEGER)")
+          conn.execute(
+              "INSERT OR REPLACE INTO incident_analytics VALUES (?, ?, ?, ?, ?)",
+              (payload["event_id"], area_key, float("{{ outputs.verify_distress_edge_tpu.vars.confidence }}"), "{{ outputs.verify_distress_edge_tpu.vars.hardware_status }}", int(payload["received_at_epoch_ms"])),
+          )
+          conn.commit()
+          coral = {"enabled": "{{ vars.coral_enabled }}" == "true", "plane": "sqlite-operational-analytics", "query": "SELECT area_key, COUNT(*) FROM incident_analytics GROUP BY area_key ORDER BY COUNT(*) DESC"}
+          print(f"::{json.dumps({'outputs': {'area_key': area_key, 'coral_sql': coral}}, separators=(',', ':'))}::")
+
+      - id: dispatch_responder_swarm
+        type: io.kestra.plugin.core.flow.EachParallel
+        value: "{{ outputs.verify_responder_security.vars.nearest_helpers }}"
+        tasks:
+          - id: telegram_dispatch
+            type: io.kestra.plugin.scripts.python.Script
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            allowFailure: true
+            env:
+              RESPONDER_CHAT_ID: "{{ json(taskrun.value).telegram_chat_id }}"
+              RESPONDER_NAME: "{{ json(taskrun.value).name }}"
+              RESPONDER_CONSOLE_URL: "{{ json(taskrun.value).responder_console_url }}"
+            script: |
+              import json, os, re, urllib.parse, urllib.request
+
+              token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+              chat_id = os.getenv("RESPONDER_CHAT_ID") or ""
+              if not token:
+                  print(f"::{json.dumps({'outputs': {'telegram_status': 'skipped', 'reason': 'missing_telegram_bot_token'}}, separators=(',', ':'))}::")
+                  raise SystemExit(0)
+              if not re.fullmatch(r"-?\d{6,20}", chat_id):
+                  print(f"::{json.dumps({'outputs': {'telegram_status': 'skipped', 'reason': 'responder_must_start_bot_to_register_chat_id', 'current_chat_id': chat_id}}, separators=(',', ':'))}::")
+                  raise SystemExit(0)
+
+              event = {{ outputs.normalize_payload.vars.payload_json }}
+              gps = event["gps"]
+              text = (
+                  "Sentinel Grid Alert\n"
+                  f"Event: {event['event_id']}\n"
+                  f"Responder: {os.getenv('RESPONDER_NAME')}\n"
+                  f"Audio AI: {{ outputs.verify_distress_edge_tpu.vars.audio_ai }}\n"
+                  f"Hardware Acceleration: {{ outputs.verify_distress_edge_tpu.vars.hardware_status }}\n"
+                  f"Cybercrime Check: {{ json(taskrun.value).cybercrime_status }}\n"
+                  f"Distance: {{ json(taskrun.value).distance_km }} km\n"
+                  f"GPS: https://maps.google.com/?q={gps['lat']},{gps['lon']}\n"
+                  f"Responder Console: {os.getenv('RESPONDER_CONSOLE_URL')}"
+              )
+              try:
+                  data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+                  with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=20) as response:
+                      body = response.read().decode("utf-8", errors="replace")
+                  print(f"::{json.dumps({'outputs': {'telegram_status': 'sent', 'chat_id': chat_id, 'telegram_response': body}}, separators=(',', ':'))}::")
+              except Exception as exc:
+                  print(f"::{json.dumps({'outputs': {'telegram_status': 'failed', 'reason': str(exc)}}, separators=(',', ':'))}::")
+
+          - id: email_dispatch
+            type: io.kestra.plugin.scripts.python.Script
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            allowFailure: true
+            env:
+              RESPONDER_EMAIL: "{{ json(taskrun.value).email }}"
+              RESPONDER_NAME: "{{ json(taskrun.value).name }}"
+              RESPONDER_CONSOLE_URL: "{{ json(taskrun.value).responder_console_url }}"
+            script: |
+              import base64, json, os, smtplib, ssl
+              from email.message import EmailMessage
+
+              to_email = os.getenv("RESPONDER_EMAIL") or ""
+              smtp_host = os.getenv("SMTP_HOST") or ""
+              smtp_user = os.getenv("SMTP_USER") or ""
+              smtp_password = os.getenv("SMTP_PASSWORD") or ""
+              if not to_email or not smtp_host or not smtp_user or not smtp_password:
+                  print(f"::{json.dumps({'outputs': {'email_status': 'skipped', 'reason': 'missing_smtp_or_responder_email'}}, separators=(',', ':'))}::")
+                  raise SystemExit(0)
+
+              event = {{ outputs.normalize_payload.vars.payload_json }}
+              gps = event["gps"]
+              msg = EmailMessage()
+              msg["Subject"] = f"Sentinel Grid Alert {event['event_id']}"
+              msg["From"] = os.getenv("SMTP_FROM") or smtp_user
+              msg["To"] = to_email
+              msg.set_content(
+                  "Sentinel Grid emergency alert\n\n"
+                  f"Responder: {os.getenv('RESPONDER_NAME')}\n"
+                  f"Event: {event['event_id']}\n"
+                  f"Audio AI: {{ outputs.verify_distress_edge_tpu.vars.audio_ai }}\n"
+                  f"Environment: {{ outputs.verify_distress_edge_tpu.vars.environment_sound }}\n"
+                  f"Transcript: {{ outputs.verify_distress_edge_tpu.vars.transcript }}\n"
+                  f"Cybercrime Check: {{ json(taskrun.value).cybercrime_status }}\n"
+                  f"Distance: {{ json(taskrun.value).distance_km }} km\n"
+                  f"GPS: https://maps.google.com/?q={gps['lat']},{gps['lon']}\n"
+                  f"Client IP: {event.get('client_ip_guess') or 'unavailable from browser'}\n"
+                  f"Device: {json.dumps(event.get('client_context') or {}, ensure_ascii=False)}\n"
+                  f"Responder Console: {os.getenv('RESPONDER_CONSOLE_URL')}\n"
+              )
+              msg.add_attachment(base64.b64decode(event["audio_b64"]), maintype="audio", subtype="wav", filename=f"{event['event_id']}-evidence.wav")
+              if event.get("image_b64"):
+                  subtype = (event.get("image_mime") or "image/jpeg").split("/")[-1]
+                  msg.add_attachment(base64.b64decode(event["image_b64"]), maintype="image", subtype=subtype, filename=f"{event['event_id']}-scene.{subtype}")
+              try:
+                  port = int(os.getenv("SMTP_PORT") or "587")
+                  with smtplib.SMTP(smtp_host, port, timeout=20) as smtp:
+                      smtp.starttls(context=ssl.create_default_context())
+                      smtp.login(smtp_user, smtp_password)
+                      smtp.send_message(msg)
+                  print(f"::{json.dumps({'outputs': {'email_status': 'sent', 'to': to_email}}, separators=(',', ':'))}::")
+              except Exception as exc:
+                  print(f"::{json.dumps({'outputs': {'email_status': 'failed', 'to': to_email, 'reason': str(exc)}}, separators=(',', ':'))}::")
+
+      - id: anonymous_report_automation
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: mcr.microsoft.com/playwright/python:v1.48.0-jammy
+        env:
+          PLAYWRIGHT_HEADLESS: "true"
+          REPORT_URL: "{{ vars.cybercrime_portal_report_url }}"
+          CYBERCRIME_AUTO_SUBMIT: "{{ vars.cybercrime_auto_submit }}"
+          SENTINEL_DEV_MODE: "{{ vars.dev_mode }}"
+        inputFiles:
+          forensic_payload.json: |
+            {
+              "event": {{ outputs.normalize_payload.vars.payload_json }},
+              "distress": {{ outputs.verify_distress_edge_tpu.vars.distress_json }},
+              "helper_security": {{ outputs.verify_responder_security.vars.checked_helpers }}
+            }
+        script: |
+          import asyncio, json, os, re
+
+          payload = json.loads(open("forensic_payload.json").read())
+          event = payload["event"]
+          gps = event.get("gps", {})
+          distress = payload.get("distress", {})
+          description = (
+              f"Sentinel Grid AI-verified distress event {event.get('event_id')}. "
+              f"Audio AI: {distress.get('audio_ai')} confidence={distress.get('confidence')}. "
+              f"Audio SHA256: {event.get('audio_sha256')}. "
+              f"Timestamp epoch ms: {event.get('received_at_epoch_ms')}. "
+              f"GPS: {gps.get('lat')},{gps.get('lon')} accuracy={gps.get('accuracy_m')}. "
+              f"Helper security: {json.dumps(payload.get('helper_security', []), ensure_ascii=False)}."
+          )
+          if os.getenv("SENTINEL_DEV_MODE", "false").lower() == "true":
+              result = {"status": "draft_ready_dev_mode", "auto_submit": False, "draft_description": description, "portal_url": os.getenv("REPORT_URL")}
+              print(f"::{json.dumps({'outputs': {'report_status': result.get('status'), 'report_result': result}}, separators=(',', ':'))}::")
+              raise SystemExit(0)
+
+          from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
+
+          async def main():
+              async with async_playwright() as pw:
+                  browser = await pw.chromium.launch(headless=os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true")
+                  context = await browser.new_context(locale="en-IN", timezone_id="Asia/Kolkata")
+                  page = await context.new_page()
+                  await page.goto(os.getenv("REPORT_URL"), wait_until="domcontentloaded", timeout=60000)
+                  textareas = page.locator("textarea")
+                  if await textareas.count():
+                      await textareas.first.fill(description)
+                  for label, value in (("Latitude", gps.get("lat")), ("Longitude", gps.get("lon"))):
+                      if value is not None:
+                          candidate = page.get_by_label(label, exact=False)
+                          if await candidate.count():
+                              await candidate.first.fill(str(value))
+                  captcha = page.locator("input[id*='captcha' i], input[name*='captcha' i]").first
+                  if await captcha.count():
+                      await browser.close()
+                      return {"status": "draft_operator_required", "reason": "captcha_present", "draft_description": description, "portal_url": os.getenv("REPORT_URL")}
+                  if os.getenv("CYBERCRIME_AUTO_SUBMIT", "false").lower() != "true":
+                      await browser.close()
+                      return {"status": "draft_ready", "auto_submit": False, "draft_description": description, "portal_url": os.getenv("REPORT_URL")}
+                  buttons = page.get_by_role("button", name=re.compile("submit|save|next", re.IGNORECASE))
+                  if await buttons.count():
+                      await buttons.first.click()
+                  try:
+                      await page.locator("text=/reference|acknowledg|submitted/i").first.wait_for(timeout=30000)
+                      receipt = await page.locator("body").inner_text(timeout=10000)
+                      status = "submitted"
+                  except PlaywrightTimeoutError:
+                      receipt = await page.locator("body").inner_text(timeout=10000)
+                      status = "unknown"
+                  await browser.close()
+                  return {"status": status, "receipt": receipt[-2000:]}
+
+          result = asyncio.run(main())
+          print(f"::{json.dumps({'outputs': {'report_status': result.get('status'), 'report_result': result}}, separators=(',', ':'))}::")
+    else:
+      - id: persist_negative_validation
+        type: io.kestra.plugin.core.log.Log
+        message: "Dropped event {{ outputs.normalize_payload.vars.event_id }} because distress confidence was below threshold."
+
+errors:
+  - id: fallback_local_audit
+    type: io.kestra.plugin.core.log.Log
+    message: "Sentinel Grid primary path failed in execution {{ execution.id }}. Local dev fallback logged; production should wire TELEGRAM_BOT_TOKEN and fallback_chat_id."

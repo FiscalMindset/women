@@ -1,0 +1,51 @@
+services:
+  kestra:
+    image: kestra/kestra:latest
+    container_name: sentinel-kestra
+    command: server standalone --worker-thread=8
+    user: "root"
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/workspace/sentinel-grid
+    environment:
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      SMTP_HOST: "${smtp_server:-smtp.gmail.com}"
+      SMTP_PORT: "587"
+      SMTP_USER: "${gmail:-}"
+      SMTP_PASSWORD: "${gmail_password:-}"
+      SMTP_FROM: "${gmail:-}"
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      KESTRA_CONFIGURATION: |
+        datasources:
+          h2:
+            url: jdbc:h2:mem:public;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+            username: sa
+            password: ""
+            driverClassName: org.h2.Driver
+        kestra:
+          repository:
+            type: h2
+          queue:
+            type: h2
+          storage:
+            type: local
+            local:
+              basePath: /tmp/kestra/storage
+          server:
+            basic-auth:
+              username: "admin@kestra.io"
+              password: "Sentinel1"
+          variables:
+            globals:
+              dev_mode: "true"
+              min_distress_confidence: "0.82"
+              responder_radius_km: "15"
+              fallback_chat_id: "0"
+              frontend_base_url: "http://127.0.0.1:5173"
+          secrets:
+            DB_URI: "jdbc:sqlite:/workspace/sentinel-grid/database/sentinel.db"
+            EDGE_TPU_MODEL_PATH: "/opt/sentinel/models/distress_edgetpu.tflite"
+            EDGE_TPU_LABELS_PATH: "/opt/sentinel/models/distress_labels.txt"
