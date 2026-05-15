@@ -39,7 +39,7 @@ type DispatchState = {
   helpers: HelperMatch[];
 };
 type AlertHistoryItem = { executionId: string; createdAt: string; responderId?: string; responderName?: string; state?: string; victimGps?: GpsFix | null };
-type VictimProfile = { name: string; phone: string; emergencyContact: string; notes: string };
+type VictimProfile = { name: string; phone: string; emergencyContact: string; trustedContacts: string; notes: string };
 type HelperRegistration = { display_name: string; phone: string; email: string; github: string; photo_url: string };
 
 const KESTRA_WEBHOOK_URL = import.meta.env.VITE_KESTRA_WEBHOOK_URL || "/kestra-webhook";
@@ -64,7 +64,7 @@ function App(): React.ReactElement {
   const [detail, setDetail] = useState("One tap sends GPS and audio evidence into Kestra. The command surface follows the live execution every second.");
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [alertHistory, setAlertHistory] = useState<AlertHistoryItem[]>([]);
-  const [victimProfile, setVictimProfile] = useState<VictimProfile>(() => readJson(VICTIM_PROFILE_KEY, { name: "", phone: "", emergencyContact: "", notes: "" }));
+  const [victimProfile, setVictimProfile] = useState<VictimProfile>(() => normalizeVictimProfile(readJson<Partial<VictimProfile>>(VICTIM_PROFILE_KEY, {})));
   const [helperRegistration, setHelperRegistration] = useState<HelperRegistration>(() => readJson(HELPER_REGISTRATION_KEY, { display_name: "", phone: "", email: "", github: "", photo_url: "" }));
   const [profileStatus, setProfileStatus] = useState("saved profile will attach to future alerts");
   const [registrationStatus, setRegistrationStatus] = useState("not submitted");
@@ -525,6 +525,7 @@ function App(): React.ReactElement {
           <span>Report {findOutput(dispatch.execution, "anonymous_report_automation", "report_status") ?? "pending"}</span>
           <span>Analytics Area {findOutput(dispatch.execution, "persist_incident_analytics", "area_key") ?? "pending"}</span>
           <span>Telegram {telegramStatus ? `${telegramStatus}${telegramReason ? `: ${telegramReason}` : ""}` : "pending"}</span>
+          <span>Trusted Contacts {findOutput(dispatch.execution, "dispatch_trusted_contacts", "trusted_email_status") ?? "pending"}</span>
         </section>
 
         <section id="route" className="panel route-panel">
@@ -597,7 +598,11 @@ function App(): React.ReactElement {
             </div>
             <input value={victimProfile.name} onChange={(event) => setVictimProfile({ ...victimProfile, name: event.target.value })} placeholder="Your name (optional)" />
             <input value={victimProfile.phone} onChange={(event) => setVictimProfile({ ...victimProfile, phone: event.target.value })} placeholder="Your phone (optional)" />
-            <input value={victimProfile.emergencyContact} onChange={(event) => setVictimProfile({ ...victimProfile, emergencyContact: event.target.value })} placeholder="Emergency contact" />
+            <input value={victimProfile.emergencyContact} onChange={(event) => setVictimProfile({ ...victimProfile, emergencyContact: event.target.value })} placeholder="Emergency contact name / note" />
+            <label className="field-stack">
+              <span>Trusted friend emails</span>
+              <textarea value={victimProfile.trustedContacts} onChange={(event) => setVictimProfile({ ...victimProfile, trustedContacts: event.target.value })} placeholder="friend@example.com" />
+            </label>
             <textarea value={victimProfile.notes} onChange={(event) => setVictimProfile({ ...victimProfile, notes: event.target.value })} placeholder="Medical notes / safety context" />
             <button type="button" onClick={saveVictimProfile}>
               <CheckCircle2 size={18} aria-hidden />
@@ -1032,6 +1037,16 @@ function readJson<T>(key: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function normalizeVictimProfile(profile: Partial<VictimProfile>): VictimProfile {
+  return {
+    name: profile.name ?? "",
+    phone: profile.phone ?? "",
+    emergencyContact: profile.emergencyContact ?? "",
+    trustedContacts: profile.trustedContacts ?? "",
+    notes: profile.notes ?? "",
+  };
 }
 
 function normalizePhotoUrl(photoUrl?: string | null, github?: string | null): string {

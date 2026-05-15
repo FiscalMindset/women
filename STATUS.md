@@ -1,6 +1,6 @@
 # Sentinel Grid Status
 
-Last updated: 2026-05-16 01:04 IST
+Last updated: 2026-05-16 01:22 IST
 
 ## Architecture Correction
 
@@ -17,6 +17,7 @@ Sentinel Grid is now Kestra + frontend in the alert path. Python is used as Kest
 - Complete: alert history persists in browser localStorage so refresh keeps local incident links.
 - Complete: responder acceptance is now Kestra-synced through `sentinel.grid.responder_accept_alert`; the victim page polls `sentinel-acceptances.json` so another browser/device can see `accepted`.
 - Complete: email dispatch attaches raw WAV evidence and the latest scene image when supplied.
+- Complete: users can save trusted friend emails in Emergency Profile; every alert sends them through Kestra task `dispatch_trusted_contacts` with a proper emergency subject, Google Maps location, tracking link, evidence summary, and attachments.
 - Complete: emergency audio capture is 8 seconds in the UI; the latest smoke used a generated 3 second WAV and Kestra reported `audio_seconds=3.0`.
 
 Latest verified alert execution:
@@ -89,6 +90,7 @@ Latest acceptance smoke:
 - `nearest_helpers_by_radius`: `helper_count=1`, `selection_mode=manual_selected_responder`, `preferred_responder_id=helper-algsoch-kumar`, distance `0.0635 km`.
 - `verify_responder_security`: `cybercrime_check=CLEAR`, `verification_mode=kestra_dev_mode_cybercrime_auto_check`, `blacklisted_count=0`.
 - `persist_incident_analytics`: `area_key=delhi:28.7:77.0`.
+- `dispatch_trusted_contacts`: sends trusted friend emails from the victim profile on every alert when SMTP is configured.
 - `telegram_dispatch`: `telegram_status=failed`, reason `HTTP Error 401: Unauthorized`.
 - `email_dispatch`: `email_status=sent` to the configured responder email.
 - `anonymous_report_automation`: `report_status=draft_ready_dev_mode`.

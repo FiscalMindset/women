@@ -28,7 +28,26 @@ tasks:
     inputFiles:
       payload.json: "{{ trigger.body }}"
     script: |
-      import base64, hashlib, io, json, pathlib, time, wave
+      import base64, hashlib, io, json, pathlib, re, time, wave
+
+      EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+      def trusted_contacts(profile):
+          raw_values = []
+          for key in ("trustedContacts", "trusted_contacts", "emergencyContact", "emergency_contact"):
+              value = profile.get(key)
+              if isinstance(value, str):
+                  raw_values.extend(re.split(r"[\n,; ]+", value))
+              elif isinstance(value, list):
+                  raw_values.extend(str(item.get("email") if isinstance(item, dict) else item) for item in value)
+          emails = []
+          seen = set()
+          for item in raw_values:
+              email = str(item or "").strip().strip("<>,;")
+              if EMAIL_RE.match(email) and email.lower() not in seen:
+                  emails.append({"email": email, "channel": "email"})
+                  seen.add(email.lower())
+          return emails
 
       raw = json.loads(pathlib.Path("payload.json").read_text())
       audio_b64 = raw.get("audio_b64") or ""
@@ -74,6 +93,7 @@ tasks:
               "consent": victim.get("consent") or "emergency_button_pressed",
               "profile": victim.get("profile") or {},
           },
+          "trusted_contacts": trusted_contacts(victim.get("profile") or {}),
           "client_context": client_context,
           "client_ip_guess": client_ip_guess,
           "source": raw.get("source") or "unknown",
@@ -427,6 +447,79 @@ tasks:
           coral = {"enabled": "{{ vars.coral_enabled }}" == "true", "plane": "sqlite-operational-analytics", "query": "SELECT area_key, COUNT(*) FROM incident_analytics GROUP BY area_key ORDER BY COUNT(*) DESC"}
           print(f"::{json.dumps({'outputs': {'area_key': area_key, 'coral_sql': coral}}, separators=(',', ':'))}::")
 
+      - id: dispatch_trusted_contacts
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        allowFailure: true
+        inputFiles:
+          payload.json: "{{ outputs.normalize_payload.vars.payload_json }}"
+          helpers.json: "{{ outputs.verify_responder_security.vars.nearest_helpers }}"
+        script: |
+          import base64, json, os, smtplib, ssl
+          from email.message import EmailMessage
+
+          event = json.load(open("payload.json"))
+          helpers = json.load(open("helpers.json"))
+          contacts = [item for item in event.get("trusted_contacts", []) if item.get("channel") == "email" and item.get("email")]
+          smtp_host = os.getenv("SMTP_HOST") or ""
+          smtp_user = os.getenv("SMTP_USER") or ""
+          smtp_password = os.getenv("SMTP_PASSWORD") or ""
+          if not contacts:
+              print(f"::{json.dumps({'outputs': {'trusted_email_status': 'skipped', 'reason': 'no_trusted_contact_emails', 'recipients': []}}, separators=(',', ':'))}::")
+              raise SystemExit(0)
+          if not smtp_host or not smtp_user or not smtp_password:
+              print(f"::{json.dumps({'outputs': {'trusted_email_status': 'skipped', 'reason': 'missing_smtp_credentials', 'recipients': [c['email'] for c in contacts]}}, separators=(',', ':'))}::")
+              raise SystemExit(0)
+
+          profile = event.get("person_in_danger", {}).get("profile", {}) or {}
+          victim_name = (profile.get("name") or "Someone").strip() or "Someone"
+          gps = event["gps"]
+          first_helper = helpers[0] if helpers else {}
+          tracking_url = ""
+          if first_helper.get("id"):
+              tracking_url = f"{{ vars.frontend_base_url }}/?track={first_helper['id']}&execution={{ execution.id }}"
+          maps_url = f"https://maps.google.com/?q={gps['lat']},{gps['lon']}"
+          subject = f"Emergency: {victim_name} needs help now near {gps['lat']:.5f},{gps['lon']:.5f}"
+          body = (
+              f"{victim_name} pressed a Sentinel Grid emergency alert.\n\n"
+              f"Location: {maps_url}\n"
+              f"GPS: {gps['lat']}, {gps['lon']} accuracy={gps.get('accuracy_m')}m\n"
+              f"Tracking page: {tracking_url or 'responder not selected yet'}\n"
+              f"AI audio result: {{ outputs.verify_distress_edge_tpu.vars.audio_ai }}\n"
+              f"Environment: {{ outputs.verify_distress_edge_tpu.vars.environment_sound }}\n"
+              f"Transcript: {{ outputs.verify_distress_edge_tpu.vars.transcript }}\n"
+              f"Emergency contact note: {profile.get('emergencyContact') or ''}\n"
+              f"Medical/safety notes: {profile.get('notes') or ''}\n"
+              f"Victim phone: {profile.get('phone') or 'not provided'}\n"
+              f"Event id: {event['event_id']}\n"
+              f"Kestra execution: {{ execution.id }}\n\n"
+              "This email is sent automatically to trusted contacts saved by the user. If this is real, call the person, share the location with local responders, and move only if safe."
+          )
+          sent = []
+          failed = []
+          port = int(os.getenv("SMTP_PORT") or "587")
+          for contact in contacts:
+              msg = EmailMessage()
+              msg["Subject"] = subject
+              msg["From"] = os.getenv("SMTP_FROM") or smtp_user
+              msg["To"] = contact["email"]
+              msg.set_content(body)
+              msg.add_attachment(base64.b64decode(event["audio_b64"]), maintype="audio", subtype="wav", filename=f"{event['event_id']}-evidence.wav")
+              if event.get("image_b64"):
+                  subtype = (event.get("image_mime") or "image/jpeg").split("/")[-1]
+                  msg.add_attachment(base64.b64decode(event["image_b64"]), maintype="image", subtype=subtype, filename=f"{event['event_id']}-scene.{subtype}")
+              try:
+                  with smtplib.SMTP(smtp_host, port, timeout=20) as smtp:
+                      smtp.starttls(context=ssl.create_default_context())
+                      smtp.login(smtp_user, smtp_password)
+                      smtp.send_message(msg)
+                  sent.append(contact["email"])
+              except Exception as exc:
+                  failed.append({"email": contact["email"], "reason": str(exc)})
+          status = "sent" if sent and not failed else "partial" if sent else "failed"
+          print(f"::{json.dumps({'outputs': {'trusted_email_status': status, 'recipients': sent, 'failed': failed, 'subject': subject, 'tracking_url': tracking_url}}, separators=(',', ':'))}::")
+
       - id: dispatch_responder_swarm
         type: io.kestra.plugin.core.flow.EachParallel
         value: "{{ outputs.verify_responder_security.vars.nearest_helpers }}"
@@ -496,12 +589,16 @@ tasks:
 
               event = {{ outputs.normalize_payload.vars.payload_json }}
               gps = event["gps"]
+              profile = event.get("person_in_danger", {}).get("profile", {}) or {}
+              victim_name = (profile.get("name") or "Someone").strip() or "Someone"
+              maps_url = f"https://maps.google.com/?q={gps['lat']},{gps['lon']}"
               msg = EmailMessage()
-              msg["Subject"] = f"Sentinel Grid Alert {event['event_id']}"
+              msg["Subject"] = f"Emergency dispatch: {victim_name} needs help near {gps['lat']:.5f},{gps['lon']:.5f}"
               msg["From"] = os.getenv("SMTP_FROM") or smtp_user
               msg["To"] = to_email
               msg.set_content(
-                  "Sentinel Grid emergency alert\n\n"
+                  "Sentinel Grid emergency dispatch\n\n"
+                  f"Person in danger: {victim_name}\n"
                   f"Responder: {os.getenv('RESPONDER_NAME')}\n"
                   f"Event: {event['event_id']}\n"
                   f"Audio AI: {{ outputs.verify_distress_edge_tpu.vars.audio_ai }}\n"
@@ -509,7 +606,11 @@ tasks:
                   f"Transcript: {{ outputs.verify_distress_edge_tpu.vars.transcript }}\n"
                   f"Cybercrime Check: {{ json(taskrun.value).cybercrime_status }}\n"
                   f"Distance: {{ json(taskrun.value).distance_km }} km\n"
-                  f"GPS: https://maps.google.com/?q={gps['lat']},{gps['lon']}\n"
+                  f"Location: {maps_url}\n"
+                  f"GPS: {gps['lat']}, {gps['lon']} accuracy={gps.get('accuracy_m')}m\n"
+                  f"Victim phone: {profile.get('phone') or 'not provided'}\n"
+                  f"Emergency contact note: {profile.get('emergencyContact') or ''}\n"
+                  f"Medical/safety notes: {profile.get('notes') or ''}\n"
                   f"Client IP: {event.get('client_ip_guess') or 'unavailable from browser'}\n"
                   f"Device: {json.dumps(event.get('client_context') or {}, ensure_ascii=False)}\n"
                   f"Responder Console: {os.getenv('RESPONDER_CONSOLE_URL')}\n"

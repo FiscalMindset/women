@@ -345,6 +345,17 @@ textarea {
   font: inherit;
 }
 
+.field-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.field-stack span {
+  color: #334155;
+  font-size: 13px;
+  font-weight: 760;
+}
+
 textarea {
   min-height: 78px;
   resize: vertical;

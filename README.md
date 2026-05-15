@@ -14,6 +14,7 @@ The product goal is simple: a person taps an alert, the system captures location
 - Tracks responder browser geolocation through a Kestra heartbeat flow.
 - Persists responder acceptance through Kestra so victim and responder browsers share the same accepted state.
 - Sends responder website links and email alerts with raw audio evidence and optional image evidence.
+- Sends trusted friend emails saved in the victim profile on every alert through Kestra task `dispatch_trusted_contacts`.
 - Keeps cybercrime report automation in draft mode by default unless the Kestra variable enables submit.
 
 ## Architecture
@@ -26,6 +27,7 @@ flowchart TD
   Edge --> Helpers["nearest_helpers_by_radius<br/>SQLite responders"]
   Helpers --> Security["verify_responder_security<br/>Cybercrime check / blacklist"]
   Security --> Analytics["persist_incident_analytics<br/>SQLite analytics"]
+  Security --> Trusted["dispatch_trusted_contacts<br/>friends/family email"]
   Security --> Dispatch["dispatch_responder_swarm"]
   Dispatch --> Email["email_dispatch<br/>audio + image evidence"]
   Dispatch --> Telegram["telegram_dispatch"]
@@ -95,6 +97,18 @@ Useful variables:
 - `gmail`, `gmail_password`, `smtp_server`: SMTP dispatch credentials consumed by `docker-compose.yml`.
 - `GROQ_API_KEY`: optional transcription key used by the Kestra distress task.
 - `VITE_KESTRA_WEBHOOK_URL`: frontend alert webhook proxy path.
+
+## Trusted Friend Notifications
+
+On the victim emergency page, add trusted friend emails in the Emergency Profile section, one per line. Every alert sends those contacts to Kestra in `trusted_contacts`. The `dispatch_trusted_contacts` task emails them with:
+
+- emergency subject including victim name and approximate coordinates,
+- Google Maps location,
+- victim tracking page,
+- AI audio result, environment, and transcript,
+- raw WAV evidence and optional scene image attachment.
+
+This is the free notification path available today if SMTP is configured. Telegram is also free, but each friend/helper must start the bot first so the system has a real chat id. Browser push can be free too, but it requires a service worker, HTTPS hosting, and each friend subscribing before an emergency. SMS and WhatsApp usually require a paid provider for reliable automatic delivery.
 
 ## Verification
 

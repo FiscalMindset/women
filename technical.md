@@ -9,7 +9,7 @@ Sentinel Grid is designed as a real-time rescue coordination surface where the f
 | Layer | Responsibility |
 | --- | --- |
 | React frontend | Sensor capture, tactical UI, Kestra polling, responder/victim route rendering |
-| Kestra | Alert orchestration, responder verification, location heartbeat, acceptance persistence, dispatch, report drafting |
+| Kestra | Alert orchestration, responder verification, trusted-contact notification, location heartbeat, acceptance persistence, dispatch, report drafting |
 | SQLite | Operational state for responders, acceptances, incident analytics |
 | Public UI snapshots | `sentinel-helpers.json` and `sentinel-acceptances.json` for browser polling |
 | Services scripts | Task code used by Kestra, not a backend feature API |
@@ -33,6 +33,7 @@ sequenceDiagram
   K->>DB: nearest_helpers_by_radius
   K->>K: verify_responder_security
   K->>DB: persist_incident_analytics
+  K->>M: dispatch_trusted_contacts
   K->>M: dispatch_responder_swarm
   K->>K: anonymous_report_automation
   K-->>F: execution id
@@ -68,6 +69,7 @@ flowchart TD
   D --> E{"route_verified_or_drop"}
   E -->|distress true| F["verify_responder_security"]
   F --> G["persist_incident_analytics"]
+  F --> T["dispatch_trusted_contacts"]
   F --> H["dispatch_responder_swarm"]
   H --> I["telegram_dispatch"]
   H --> J["email_dispatch"]
@@ -123,6 +125,7 @@ The tenant-aware `/main` segment is required. Without it, Kestra can return fals
 | --- | --- |
 | Live Incident | `normalize_payload`, selected helper, acceptance snapshot |
 | Kestra Outputs | Kestra task outputs |
+| Trusted Contacts | `dispatch_trusted_contacts` task outputs |
 | Rescue Route | victim GPS from execution + responder GPS from helper snapshot |
 | Audio Evidence | `normalize_payload.audio_data_url`, `verify_distress_edge_tpu` outputs |
 | Verified Nearby Responders | `nearest_helpers` output or `sentinel-helpers.json` |
@@ -171,10 +174,15 @@ erDiagram
   }
 ```
 
+## Trusted Contact Delivery
+
+The victim profile stores trusted friend emails as local browser state. On every alert, the frontend sends that profile to Kestra. `normalize_payload` extracts valid email addresses into `trusted_contacts`, and `dispatch_trusted_contacts` sends a separate emergency email path before responder swarm delivery.
+
+This path is intentionally independent of nearest-responder matching. Even if no nearby verified responder is found, the user's saved trusted contacts still receive the emergency email when SMTP is configured.
+
 ## Deployment Notes
 
 - Do not commit `.env`, SQLite data files, generated snapshots, `node_modules`, or build output.
 - Kestra currently uses in-memory H2 in local Docker config, so flows must be redeployed after a container restart.
 - Telegram dispatch requires a valid bot token and a real numeric chat id from a responder who has started the bot.
 - Groq transcription requires a valid `GROQ_API_KEY`; failures are surfaced as `transcript_source` in Kestra outputs.
-
