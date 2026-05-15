@@ -1,6 +1,6 @@
 # Sentinel Grid Status
 
-Last updated: 2026-05-16 01:22 IST
+Last updated: 2026-05-16 01:39 IST
 
 ## Architecture Correction
 
@@ -18,6 +18,10 @@ Sentinel Grid is now Kestra + frontend in the alert path. Python is used as Kest
 - Complete: responder acceptance is now Kestra-synced through `sentinel.grid.responder_accept_alert`; the victim page polls `sentinel-acceptances.json` so another browser/device can see `accepted`.
 - Complete: email dispatch attaches raw WAV evidence and the latest scene image when supplied.
 - Complete: users can save trusted friend emails in Emergency Profile; every alert sends them through Kestra task `dispatch_trusted_contacts` with a proper emergency subject, Google Maps location, tracking link, evidence summary, and attachments.
+- Complete: trusted friend input accepts bulk emails separated by comma, semicolon, whitespace, or new lines.
+- Complete: helper accepted-count and last-accepted timestamps are persisted by Kestra for future ranking/reward logic.
+- Complete: admin ops page `/?admin=ops` triggers Kestra flow `admin_ops_snapshot` and reads `sentinel-admin.json`.
+- Complete: saved Emergency Profile collapses into a User Account summary; edit reveals the form again.
 - Complete: emergency audio capture is 8 seconds in the UI; the latest smoke used a generated 3 second WAV and Kestra reported `audio_seconds=3.0`.
 
 Latest verified alert execution:
@@ -69,6 +73,7 @@ Latest location heartbeat smoke:
 ## Responder Acceptance
 
 - Complete: new Kestra flow `sentinel.grid.responder_accept_alert` persists acceptance to SQLite table `responder_acceptances`.
+- Complete: acceptance flow updates each helper's `accepted_count` and `last_accepted_at`.
 - Complete: the flow writes `frontend/public/sentinel-acceptances.json`.
 - Complete: the victim UI polls this snapshot every 2 seconds and merges it with local acceptance state.
 
@@ -81,6 +86,14 @@ Latest acceptance smoke:
 - Responder: `helper-algsoch-kumar`
 - Snapshot acceptance keys written: `2`
 - Browser verification: victim tracking page showed `Acceptance accepted` and `accepted 01:04:00`.
+
+Latest admin ops smoke:
+
+- Execution id: `6g0sOrZv3pSHZsYOdtGDgN`
+- Flow: `sentinel.grid.admin_ops_snapshot`
+- State: `SUCCESS`
+- Snapshot summary: `helpers_total=2`, `helpers_verified=2`, `helpers_flagged=0`, `acceptances_total=2`, `incidents_total=22`.
+- Accepted counts: `helper-algsoch-kumar=1`, `helper-vicky-kumar=1`.
 
 ## Kestra Node Outputs From Latest Alert
 

@@ -327,6 +327,17 @@ dl,
   gap: 10px;
 }
 
+.account-summary {
+  display: grid;
+  gap: 8px;
+}
+
+.account-summary span {
+  color: #334155;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
 .onboarding-panel {
   grid-column: 1 / -1;
   width: min(100%, 720px);
@@ -475,6 +486,67 @@ dd {
 
 .responder-console {
   grid-column: 1 / -1;
+}
+
+.admin-panel {
+  grid-column: 1 / -1;
+}
+
+.admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.admin-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.admin-metrics span,
+.admin-row {
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8fafc;
+}
+
+.admin-metrics span {
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 780;
+}
+
+.admin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.admin-grid h3 {
+  margin: 0 0 8px;
+  color: #0f172a;
+  font-size: 14px;
+}
+
+.admin-row {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.admin-row strong,
+.admin-row span {
+  overflow-wrap: anywhere;
+}
+
+.admin-row span {
+  color: #53616f;
+  font-size: 12px;
 }
 
 .kestra-frame {

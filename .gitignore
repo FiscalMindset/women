@@ -16,8 +16,11 @@ database/*.sqlite
 database/*.sqlite3
 frontend/public/sentinel-helpers.json
 frontend/public/sentinel-acceptances.json
+frontend/public/sentinel-admin.json
 
 __pycache__/
 *.py[cod]
 *.log
 
+project2.md
+project3.md

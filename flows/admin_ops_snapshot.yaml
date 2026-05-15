@@ -1,0 +1,127 @@
+id: admin_ops_snapshot
+namespace: sentinel.grid
+description: "Kestra-owned admin operations snapshot for Sentinel Grid: responder integrity, acceptance counts, location freshness, and incident analytics."
+
+variables:
+  db_path: "/workspace/sentinel-grid/database/sentinel.db"
+  ui_snapshot_path: "/workspace/sentinel-grid/frontend/public/sentinel-admin.json"
+
+triggers:
+  - id: admin-snapshot
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: admin-snapshot
+    wait: false
+
+tasks:
+  - id: build_admin_snapshot
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    script: |
+      import json, pathlib, sqlite3
+      from datetime import datetime, timezone
+
+      db_path = "{{ vars.db_path }}"
+      snapshot_path = pathlib.Path("{{ vars.ui_snapshot_path }}")
+      conn = sqlite3.connect(db_path)
+      existing = {row[1] for row in conn.execute("PRAGMA table_info(responders)")}
+      migrations = {
+          "verification_status": "ALTER TABLE responders ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'",
+          "cybercrime_status": "ALTER TABLE responders ADD COLUMN cybercrime_status TEXT NOT NULL DEFAULT 'unchecked'",
+          "cybercrime_checked_at": "ALTER TABLE responders ADD COLUMN cybercrime_checked_at TEXT",
+          "blacklist_reason": "ALTER TABLE responders ADD COLUMN blacklist_reason TEXT",
+          "verification_source": "ALTER TABLE responders ADD COLUMN verification_source TEXT",
+          "location_updated_at": "ALTER TABLE responders ADD COLUMN location_updated_at TEXT",
+          "last_execution_id": "ALTER TABLE responders ADD COLUMN last_execution_id TEXT",
+          "last_location_accuracy_m": "ALTER TABLE responders ADD COLUMN last_location_accuracy_m REAL",
+          "accepted_count": "ALTER TABLE responders ADD COLUMN accepted_count INTEGER NOT NULL DEFAULT 0",
+          "last_accepted_at": "ALTER TABLE responders ADD COLUMN last_accepted_at TEXT",
+      }
+      for column, statement in migrations.items():
+          if column not in existing:
+              conn.execute(statement)
+      conn.execute(
+          """
+          CREATE TABLE IF NOT EXISTS responder_acceptances (
+            execution_id TEXT NOT NULL,
+            responder_id TEXT NOT NULL,
+            responder_name TEXT,
+            accepted_at TEXT NOT NULL,
+            latitude REAL,
+            longitude REAL,
+            PRIMARY KEY (execution_id, responder_id)
+          )
+          """
+      )
+      conn.execute(
+          "CREATE TABLE IF NOT EXISTS incident_analytics (event_id TEXT PRIMARY KEY, area_key TEXT, distress_confidence REAL, hardware_status TEXT, created_at_epoch_ms INTEGER)"
+      )
+      for row in conn.execute(
+          """
+          SELECT responder_id, COUNT(*) AS accepted_count, MAX(accepted_at) AS last_accepted_at
+          FROM responder_acceptances
+          GROUP BY responder_id
+          """
+      ).fetchall():
+          conn.execute(
+              "UPDATE responders SET accepted_count = ?, last_accepted_at = ? WHERE id = ?",
+              (row[1], row[2], row[0]),
+          )
+      conn.commit()
+      conn.row_factory = sqlite3.Row
+      helpers = [dict(row) for row in conn.execute(
+          """
+          SELECT id, telegram_chat_id, display_name, phone, email, github, photo_url,
+                 latitude, longitude, active, verification_status, cybercrime_status,
+                 cybercrime_checked_at, blacklist_reason, verification_source, location_updated_at,
+                 last_execution_id, last_location_accuracy_m, accepted_count, last_accepted_at
+          FROM responders
+          ORDER BY accepted_count DESC, active DESC, display_name COLLATE NOCASE
+          """
+      ).fetchall()]
+      acceptances = [dict(row) for row in conn.execute(
+          """
+          SELECT execution_id, responder_id, responder_name, accepted_at, latitude, longitude
+          FROM responder_acceptances
+          ORDER BY accepted_at DESC
+          LIMIT 100
+          """
+      ).fetchall()]
+      incidents = [dict(row) for row in conn.execute(
+          """
+          SELECT event_id, area_key, distress_confidence, hardware_status, created_at_epoch_ms
+          FROM incident_analytics
+          ORDER BY created_at_epoch_ms DESC
+          LIMIT 100
+          """
+      ).fetchall()]
+      top_areas = [dict(row) for row in conn.execute(
+          """
+          SELECT area_key, COUNT(*) AS incident_count, ROUND(AVG(distress_confidence), 3) AS avg_confidence
+          FROM incident_analytics
+          GROUP BY area_key
+          ORDER BY incident_count DESC, avg_confidence DESC
+          LIMIT 20
+          """
+      ).fetchall()]
+      summary = {
+          "helpers_total": len(helpers),
+          "helpers_active": sum(1 for helper in helpers if helper.get("active") in (1, True)),
+          "helpers_verified": sum(1 for helper in helpers if helper.get("verification_status") == "verified"),
+          "helpers_flagged": sum(1 for helper in helpers if helper.get("cybercrime_status") == "flagged"),
+          "acceptances_total": len(acceptances),
+          "incidents_total": len(incidents),
+      }
+      payload = {
+          "source": db_path,
+          "generated_at": datetime.now(timezone.utc).isoformat(),
+          "summary": summary,
+          "helpers": helpers,
+          "acceptances": acceptances,
+          "incident_analytics": incidents,
+          "top_areas": top_areas,
+      }
+      snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+      snapshot_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+      conn.commit()
+      print(f"::{json.dumps({'outputs': {'snapshot_written': True, 'summary': summary, 'snapshot_path': str(snapshot_path)}}, separators=(',', ':'))}::")

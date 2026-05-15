@@ -27,6 +27,12 @@ export default defineConfig({
                 headers: { Authorization: "Basic YWRtaW5Aa2VzdHJhLmlvOlNlbnRpbmVsMQ==" },
                 rewrite: function () { return "/api/v1/main/executions/webhook/sentinel.grid/responder_accept_alert/accept-alert"; },
             },
+            "/kestra-admin-snapshot": {
+                target: "http://localhost:8080",
+                changeOrigin: true,
+                headers: { Authorization: "Basic YWRtaW5Aa2VzdHJhLmlvOlNlbnRpbmVsMQ==" },
+                rewrite: function () { return "/api/v1/main/executions/webhook/sentinel.grid/admin_ops_snapshot/admin-snapshot"; },
+            },
             "/kestra-api": {
                 target: "http://localhost:8080",
                 changeOrigin: true,

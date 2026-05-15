@@ -24,12 +24,15 @@ type HelperMatch = {
   responder_console_url?: string | null;
   verification_source?: string | null;
   location_updated_at?: string | null;
+  accepted_count?: number | null;
+  last_accepted_at?: string | null;
 };
 type TaskOutputs = Record<string, unknown> & { rows?: HelperMatch[]; nearest_helpers?: HelperMatch[]; checked_helpers?: HelperMatch[]; vars?: TaskOutputs };
 type TaskRun = { id?: string; taskId?: string; state?: { current?: string }; outputs?: TaskOutputs; attempts?: { state?: { current?: string } }[] };
 type ExecutionResponse = { id?: string; flowRevision?: number; state?: { current?: string }; taskRunList?: TaskRun[] };
 type HelperSnapshot = { helpers?: HelperMatch[] };
-type AcceptanceSnapshot = { acceptances?: Record<string, string> };
+type AcceptanceMetric = { accepted_count?: number; last_accepted_at?: string | null };
+type AcceptanceSnapshot = { acceptances?: Record<string, string>; acceptance_counts?: Record<string, AcceptanceMetric> };
 type HelperRegistrationPosition = { lat: number; lon: number; accuracy_m: number | null; source: string };
 type DispatchState = {
   count: number;
@@ -41,11 +44,20 @@ type DispatchState = {
 type AlertHistoryItem = { executionId: string; createdAt: string; responderId?: string; responderName?: string; state?: string; victimGps?: GpsFix | null };
 type VictimProfile = { name: string; phone: string; emergencyContact: string; trustedContacts: string; notes: string };
 type HelperRegistration = { display_name: string; phone: string; email: string; github: string; photo_url: string };
+type AdminSnapshot = {
+  generated_at?: string;
+  summary?: Record<string, number>;
+  helpers?: HelperMatch[];
+  acceptances?: Array<Record<string, unknown>>;
+  incident_analytics?: Array<Record<string, unknown>>;
+  top_areas?: Array<Record<string, unknown>>;
+};
 
 const KESTRA_WEBHOOK_URL = import.meta.env.VITE_KESTRA_WEBHOOK_URL || "/kestra-webhook";
 const KESTRA_REGISTER_HELPER_URL = import.meta.env.VITE_KESTRA_REGISTER_HELPER_URL || "/kestra-register-helper";
 const KESTRA_LOCATION_PING_URL = import.meta.env.VITE_KESTRA_LOCATION_PING_URL || "/kestra-location-ping";
 const KESTRA_ACCEPT_ALERT_URL = import.meta.env.VITE_KESTRA_ACCEPT_ALERT_URL || "/kestra-accept-alert";
+const KESTRA_ADMIN_SNAPSHOT_URL = import.meta.env.VITE_KESTRA_ADMIN_SNAPSHOT_URL || "/kestra-admin-snapshot";
 const KESTRA_API_BASE = "/kestra-api";
 const KESTRA_UI_BASE = import.meta.env.VITE_KESTRA_UI_BASE || `${window.location.protocol}//${window.location.hostname || "localhost"}:8080`;
 const KESTRA_BASIC_AUTH_TOKEN = import.meta.env.VITE_KESTRA_BASIC_AUTH_TOKEN || "YWRtaW5Aa2VzdHJhLmlvOlNlbnRpbmVsMQ==";
@@ -67,8 +79,12 @@ function App(): React.ReactElement {
   const [victimProfile, setVictimProfile] = useState<VictimProfile>(() => normalizeVictimProfile(readJson<Partial<VictimProfile>>(VICTIM_PROFILE_KEY, {})));
   const [helperRegistration, setHelperRegistration] = useState<HelperRegistration>(() => readJson(HELPER_REGISTRATION_KEY, { display_name: "", phone: "", email: "", github: "", photo_url: "" }));
   const [profileStatus, setProfileStatus] = useState("saved profile will attach to future alerts");
+  const [profileExpanded, setProfileExpanded] = useState(() => !localStorage.getItem(VICTIM_PROFILE_KEY));
   const [registrationStatus, setRegistrationStatus] = useState("not submitted");
   const [snapshotHelpers, setSnapshotHelpers] = useState<HelperMatch[]>([]);
+  const [acceptanceCounts, setAcceptanceCounts] = useState<Record<string, AcceptanceMetric>>({});
+  const [adminSnapshot, setAdminSnapshot] = useState<AdminSnapshot | null>(null);
+  const [adminStatus, setAdminStatus] = useState("admin snapshot pending");
   const [selectedResponderId, setSelectedResponderId] = useState<string | null>(() => params.get("track") ?? null);
   const [locationPingStatus, setLocationPingStatus] = useState("location ping pending");
   const [dispatch, setDispatch] = useState<DispatchState>({ count: 0, activeExecutionId: null, lastResult: "none", execution: null, helpers: [] });
@@ -78,8 +94,9 @@ function App(): React.ReactElement {
   const executionFromUrl = params.get("execution");
   const isResponderMode = Boolean(responderId);
   const isHelperOnboarding = params.get("onboard") === "helper" || params.get("register") === "helper";
+  const isAdminMode = params.get("admin") === "ops";
   const isVictimTrackingMode = Boolean(trackingResponderId && executionFromUrl);
-  const showEmergencySetup = !isResponderMode && !isHelperOnboarding && !isVictimTrackingMode;
+  const showEmergencySetup = !isResponderMode && !isHelperOnboarding && !isVictimTrackingMode && !isAdminMode;
   const contextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
@@ -106,6 +123,7 @@ function App(): React.ReactElement {
         .then((response) => (response.ok ? response.json() : null))
         .then((payload: AcceptanceSnapshot | null) => {
           if (!stopped && payload?.acceptances) setAcceptedBy({ ...readAcceptanceStore(), ...payload.acceptances });
+          if (!stopped && payload?.acceptance_counts) setAcceptanceCounts(payload.acceptance_counts);
         })
         .catch(() => {
           if (!stopped) setAcceptedBy(readAcceptanceStore());
@@ -236,6 +254,25 @@ function App(): React.ReactElement {
   const telegramStatus = findOutput(dispatch.execution, "telegram_dispatch", "telegram_status");
   const telegramReason = findOutput(dispatch.execution, "telegram_dispatch", "reason");
 
+  const refreshAdminSnapshot = useCallback(async () => {
+    setAdminStatus("refreshing Kestra admin snapshot");
+    try {
+      await fetch(KESTRA_ADMIN_SNAPSHOT_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const response = await fetch(`/sentinel-admin.json?ts=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`admin snapshot HTTP ${response.status}`);
+      const payload = (await response.json()) as AdminSnapshot;
+      setAdminSnapshot(payload);
+      setAdminStatus(`updated ${payload.generated_at ? new Date(payload.generated_at).toLocaleTimeString() : new Date().toLocaleTimeString()}`);
+    } catch (error) {
+      setAdminStatus(readableError(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isAdminMode) return;
+    void refreshAdminSnapshot();
+  }, [isAdminMode, refreshAdminSnapshot]);
+
   useEffect(() => {
     if (!isResponderMode || !responderId || !navigator.geolocation) return;
     let cancelled = false;
@@ -310,6 +347,7 @@ function App(): React.ReactElement {
   const saveVictimProfile = useCallback(() => {
     localStorage.setItem(VICTIM_PROFILE_KEY, JSON.stringify(victimProfile));
     setProfileStatus(`saved ${new Date().toLocaleTimeString()}`);
+    setProfileExpanded(false);
     setStatus("profile saved");
     setDetail("Emergency profile saved locally and will be attached to future Kestra alerts.");
   }, [victimProfile]);
@@ -452,8 +490,8 @@ function App(): React.ReactElement {
       <section className="command">
         <div>
           <span className="eyebrow">{isResponderMode ? "Responder Dispatch" : "Sentinel Grid Tactical Command"}</span>
-          <h1>{isResponderMode ? "Rescue Assignment" : isHelperOnboarding ? "Helper Onboarding" : isVictimTrackingMode ? "Live Rescue Tracking" : "Emergency Tap"}</h1>
-          <p>{isResponderMode ? "Accept the alert, see the person-in-danger location, inspect evidence, and navigate." : isHelperOnboarding ? "Register a responder profile through Kestra, then use the responder console link during alerts." : isVictimTrackingMode ? "Watch responder acceptance, evidence, route, and Kestra execution state for this alert." : "Request help, watch responder acceptance, and track arrival like a live delivery handoff."}</p>
+          <h1>{isResponderMode ? "Rescue Assignment" : isHelperOnboarding ? "Helper Onboarding" : isAdminMode ? "Admin Ops" : isVictimTrackingMode ? "Live Rescue Tracking" : "Emergency Tap"}</h1>
+          <p>{isResponderMode ? "Accept the alert, see the person-in-danger location, inspect evidence, and navigate." : isHelperOnboarding ? "Register a responder profile through Kestra, then use the responder console link during alerts." : isAdminMode ? "Inspect responder integrity, acceptance counts, incident areas, and operational snapshots from Kestra and SQLite." : isVictimTrackingMode ? "Watch responder acceptance, evidence, route, and Kestra execution state for this alert." : "Request help, watch responder acceptance, and track arrival like a live delivery handoff."}</p>
         </div>
 
         <div className="control">
@@ -475,12 +513,15 @@ function App(): React.ReactElement {
         <a href="#evidence">Evidence</a>
         {showEmergencySetup ? <a href="#profile">Profile</a> : null}
         {!isResponderMode ? <a href="/?onboard=helper">Become helper</a> : null}
+        {!isResponderMode ? <a href="/?admin=ops">Admin ops</a> : null}
         {!isResponderMode ? <a href="#helpers">Helpers</a> : null}
         <a href="#history">Past alerts</a>
         <a href="#kestra">Kestra</a>
       </nav>
 
       <section className="grid">
+        {isAdminMode ? <AdminOpsPanel snapshot={adminSnapshot} status={adminStatus} onRefresh={refreshAdminSnapshot} /> : null}
+
         {!isResponderMode && activeAcceptance ? (
           <section className="panel acceptance-banner">
             <CheckCircle2 size={20} aria-hidden />
@@ -594,21 +635,35 @@ function App(): React.ReactElement {
           <section id="profile" className="panel profile-panel">
             <div className="panel-title">
               <UserRound size={18} aria-hidden />
-              <h2>Emergency Profile</h2>
+              <h2>{profileExpanded ? "Emergency Profile" : "User Account"}</h2>
             </div>
-            <input value={victimProfile.name} onChange={(event) => setVictimProfile({ ...victimProfile, name: event.target.value })} placeholder="Your name (optional)" />
-            <input value={victimProfile.phone} onChange={(event) => setVictimProfile({ ...victimProfile, phone: event.target.value })} placeholder="Your phone (optional)" />
-            <input value={victimProfile.emergencyContact} onChange={(event) => setVictimProfile({ ...victimProfile, emergencyContact: event.target.value })} placeholder="Emergency contact name / note" />
-            <label className="field-stack">
-              <span>Trusted friend emails</span>
-              <textarea value={victimProfile.trustedContacts} onChange={(event) => setVictimProfile({ ...victimProfile, trustedContacts: event.target.value })} placeholder="friend@example.com" />
-            </label>
-            <textarea value={victimProfile.notes} onChange={(event) => setVictimProfile({ ...victimProfile, notes: event.target.value })} placeholder="Medical notes / safety context" />
-            <button type="button" onClick={saveVictimProfile}>
-              <CheckCircle2 size={18} aria-hidden />
-              Save Profile
-            </button>
-            <span className="form-status">{profileStatus}</span>
+            {profileExpanded ? (
+              <>
+                <input value={victimProfile.name} onChange={(event) => setVictimProfile({ ...victimProfile, name: event.target.value })} placeholder="Your name (optional)" />
+                <input value={victimProfile.phone} onChange={(event) => setVictimProfile({ ...victimProfile, phone: event.target.value })} placeholder="Your phone (optional)" />
+                <input value={victimProfile.emergencyContact} onChange={(event) => setVictimProfile({ ...victimProfile, emergencyContact: event.target.value })} placeholder="Emergency contact name / note" />
+                <label className="field-stack">
+                  <span>Trusted friend emails</span>
+                  <textarea value={victimProfile.trustedContacts} onChange={(event) => setVictimProfile({ ...victimProfile, trustedContacts: event.target.value })} placeholder="friend@example.com, another@example.com" />
+                </label>
+                <textarea value={victimProfile.notes} onChange={(event) => setVictimProfile({ ...victimProfile, notes: event.target.value })} placeholder="Medical notes / safety context" />
+                <button type="button" onClick={saveVictimProfile}>
+                  <CheckCircle2 size={18} aria-hidden />
+                  Save Profile
+                </button>
+                <span className="form-status">{profileStatus}</span>
+              </>
+            ) : (
+              <div className="account-summary">
+                <span>Name {victimProfile.name || "not set"}</span>
+                <span>Phone {victimProfile.phone || "not set"}</span>
+                <span>Trusted contacts {trustedEmailCount(victimProfile.trustedContacts)}</span>
+                <span>Emergency note {victimProfile.emergencyContact || "not set"}</span>
+                <button type="button" className="secondary" onClick={() => setProfileExpanded(true)}>
+                  Edit Profile
+                </button>
+              </div>
+            )}
           </section>
 
           </>
@@ -657,6 +712,7 @@ function App(): React.ReactElement {
                       ? acceptedBy[acceptanceKey(dispatch.activeExecutionId, helper.id)] ?? acceptedBy[executionAcceptanceKey(dispatch.activeExecutionId)]
                       : null
                   }
+                  acceptanceMetric={acceptanceCounts[helper.id]}
                   selected={primaryResponder?.id === helper.id}
                   onSelect={() => setSelectedResponderId(helper.id)}
                 />
@@ -753,11 +809,78 @@ function App(): React.ReactElement {
   );
 }
 
+function AdminOpsPanel({ snapshot, status, onRefresh }: { snapshot: AdminSnapshot | null; status: string; onRefresh: () => void }): React.ReactElement {
+  const summary = snapshot?.summary ?? {};
+  const helpers = snapshot?.helpers ?? [];
+  const acceptances = snapshot?.acceptances ?? [];
+  const topAreas = snapshot?.top_areas ?? [];
+  return (
+    <section className="panel admin-panel">
+      <div className="panel-title">
+        <Database size={18} aria-hidden />
+        <h2>Admin Ops Snapshot</h2>
+      </div>
+      <div className="admin-actions">
+        <button type="button" onClick={onRefresh}>
+          <Activity size={18} aria-hidden />
+          Refresh Kestra Snapshot
+        </button>
+        <span className="form-status">{status}</span>
+      </div>
+      <div className="admin-metrics">
+        <span>Helpers {summary.helpers_total ?? 0}</span>
+        <span>Active {summary.helpers_active ?? 0}</span>
+        <span>Verified {summary.helpers_verified ?? 0}</span>
+        <span>Flagged {summary.helpers_flagged ?? 0}</span>
+        <span>Acceptances {summary.acceptances_total ?? 0}</span>
+        <span>Incidents {summary.incidents_total ?? 0}</span>
+      </div>
+      <div className="admin-grid">
+        <section>
+          <h3>Responder Performance</h3>
+          {helpers.length === 0 ? <p className="empty">No responders in admin snapshot.</p> : null}
+          {helpers.slice(0, 12).map((helper) => (
+            <div key={helper.id} className="admin-row">
+              <strong>{helper.name ?? helper.display_name ?? helper.id}</strong>
+              <span>{helper.verification_status ?? "verification pending"} / {helper.cybercrime_status ?? "cybercrime pending"}</span>
+              <span>accepted {helper.accepted_count ?? 0}</span>
+              <span>{helper.last_accepted_at ? `last ${new Date(helper.last_accepted_at).toLocaleString()}` : "no accepted alerts yet"}</span>
+            </div>
+          ))}
+        </section>
+        <section>
+          <h3>Recent Acceptances</h3>
+          {acceptances.length === 0 ? <p className="empty">No acceptances recorded yet.</p> : null}
+          {acceptances.slice(0, 10).map((item, index) => (
+            <div key={`${String(item.execution_id ?? index)}-${String(item.responder_id ?? index)}`} className="admin-row">
+              <strong>{String(item.responder_name ?? item.responder_id ?? "responder")}</strong>
+              <span>{String(item.execution_id ?? "execution pending")}</span>
+              <span>{item.accepted_at ? new Date(String(item.accepted_at)).toLocaleString() : "accepted time pending"}</span>
+            </div>
+          ))}
+        </section>
+        <section>
+          <h3>Hot Areas</h3>
+          {topAreas.length === 0 ? <p className="empty">No incident analytics yet.</p> : null}
+          {topAreas.slice(0, 10).map((item, index) => (
+            <div key={`${String(item.area_key ?? index)}`} className="admin-row">
+              <strong>{String(item.area_key ?? "area pending")}</strong>
+              <span>incidents {String(item.incident_count ?? 0)}</span>
+              <span>avg confidence {String(item.avg_confidence ?? "pending")}</span>
+            </div>
+          ))}
+        </section>
+      </div>
+    </section>
+  );
+}
+
 function HelperCard({
   helper,
   executionId,
   victimGps,
   acceptedAt,
+  acceptanceMetric,
   selected,
   onSelect,
 }: {
@@ -765,6 +888,7 @@ function HelperCard({
   executionId: string | null;
   victimGps: GpsFix | null;
   acceptedAt: string | null;
+  acceptanceMetric?: AcceptanceMetric;
   selected: boolean;
   onSelect: () => void;
 }): React.ReactElement {
@@ -773,6 +897,8 @@ function HelperCard({
   const cybercrime = normalizeBadge(helper.cybercrime_status, "unchecked");
   const trackingUrl = executionId ? `/?track=${encodeURIComponent(helper.id)}&execution=${encodeURIComponent(executionId)}` : null;
   const route = routeSummary(victimGps, helper);
+  const acceptedCount = Number(acceptanceMetric?.accepted_count ?? helper.accepted_count ?? 0);
+  const lastAcceptedAt = acceptanceMetric?.last_accepted_at ?? helper.last_accepted_at;
   return (
     <article>
       <img src={normalizePhotoUrl(helper.photo_url, helper.github)} alt={name} />
@@ -785,6 +911,8 @@ function HelperCard({
         <span>{helper.email ?? "email pending"}</span>
         <span>{helper.verification_source ? `Verified by ${helper.verification_source}` : "verification source pending"}</span>
         <span>{helper.cybercrime_checked_at ? `Cybercrime checked ${new Date(helper.cybercrime_checked_at).toLocaleString()}` : "cybercrime check pending"}</span>
+        <span>Accepted alerts {acceptedCount}</span>
+        <span>{lastAcceptedAt ? `Last accepted ${new Date(lastAcceptedAt).toLocaleString()}` : "last acceptance pending"}</span>
         {executionId ? (
           <div className="inline-route">
             <span>{route ? `${route.distanceKm.toFixed(2)} km / ${route.etaMinutes} min ETA` : "route pending"}</span>
@@ -1047,6 +1175,14 @@ function normalizeVictimProfile(profile: Partial<VictimProfile>): VictimProfile 
     trustedContacts: profile.trustedContacts ?? "",
     notes: profile.notes ?? "",
   };
+}
+
+function trustedEmailCount(value: string): number {
+  const emails = value
+    .split(/[\n,; ]+/)
+    .map((item) => item.trim())
+    .filter((item) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(item));
+  return new Set(emails.map((email) => email.toLowerCase())).size;
 }
 
 function normalizePhotoUrl(photoUrl?: string | null, github?: string | null): string {

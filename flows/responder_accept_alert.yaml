@@ -35,6 +35,14 @@ tasks:
       db_path = "{{ vars.db_path }}"
       snapshot_path = pathlib.Path("{{ vars.ui_snapshot_path }}")
       conn = sqlite3.connect(db_path)
+      existing = {row[1] for row in conn.execute("PRAGMA table_info(responders)")}
+      migrations = {
+          "accepted_count": "ALTER TABLE responders ADD COLUMN accepted_count INTEGER NOT NULL DEFAULT 0",
+          "last_accepted_at": "ALTER TABLE responders ADD COLUMN last_accepted_at TEXT",
+      }
+      for column, statement in migrations.items():
+          if column not in existing:
+              conn.execute(statement)
       conn.execute(
           """
           CREATE TABLE IF NOT EXISTS responder_acceptances (
@@ -60,6 +68,14 @@ tasks:
           """,
           (execution_id, responder_id, payload.get("responder_name") or responder_id, accepted_at, lat, lon),
       )
+      accepted_count = conn.execute(
+          "SELECT COUNT(*) FROM responder_acceptances WHERE responder_id = ?",
+          (responder_id,),
+      ).fetchone()[0]
+      conn.execute(
+          "UPDATE responders SET accepted_count = ?, last_accepted_at = ? WHERE id = ?",
+          (accepted_count, accepted_at, responder_id),
+      )
       conn.commit()
       conn.row_factory = sqlite3.Row
       rows = conn.execute(
@@ -74,12 +90,21 @@ tasks:
       for row in rows:
           acceptances[f"sentinel-acceptance:{row['execution_id']}:{row['responder_id']}"] = row["accepted_at"]
           acceptances[f"sentinel-acceptance:{row['execution_id']}:accepted"] = row["accepted_at"]
+      count_rows = conn.execute(
+          """
+          SELECT responder_id, COUNT(*) AS accepted_count, MAX(accepted_at) AS last_accepted_at
+          FROM responder_acceptances
+          GROUP BY responder_id
+          """
+      ).fetchall()
+      acceptance_counts = {row["responder_id"]: {"accepted_count": row["accepted_count"], "last_accepted_at": row["last_accepted_at"]} for row in count_rows}
       snapshot = {
           "source": db_path,
           "generated_at": datetime.now(timezone.utc).isoformat(),
           "acceptances": acceptances,
+          "acceptance_counts": acceptance_counts,
           "events": [dict(row) for row in rows],
       }
       snapshot_path.parent.mkdir(parents=True, exist_ok=True)
       snapshot_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-      print(f"::{json.dumps({'outputs': {'accepted': True, 'execution_id': execution_id, 'responder_id': responder_id, 'accepted_at': accepted_at, 'snapshot_acceptances': len(acceptances)}}, separators=(',', ':'))}::")
+      print(f"::{json.dumps({'outputs': {'accepted': True, 'execution_id': execution_id, 'responder_id': responder_id, 'accepted_at': accepted_at, 'accepted_count': accepted_count, 'snapshot_acceptances': len(acceptances)}}, separators=(',', ':'))}::")

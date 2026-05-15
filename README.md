@@ -15,6 +15,8 @@ The product goal is simple: a person taps an alert, the system captures location
 - Persists responder acceptance through Kestra so victim and responder browsers share the same accepted state.
 - Sends responder website links and email alerts with raw audio evidence and optional image evidence.
 - Sends trusted friend emails saved in the victim profile on every alert through Kestra task `dispatch_trusted_contacts`.
+- Tracks total accepted alerts per helper for future responder ranking and reward logic.
+- Provides an admin ops view at `/?admin=ops` backed by Kestra flow `admin_ops_snapshot`.
 - Keeps cybercrime report automation in draft mode by default unless the Kestra variable enables submit.
 
 ## Architecture
@@ -36,10 +38,13 @@ flowchart TD
   ResponderURL --> Responder["Responder browser"]
   Responder -->|accept alert| AcceptFlow["Kestra webhook<br/>responder_accept_alert"]
   Responder -->|live GPS ping| LocationFlow["Kestra webhook<br/>responder_location_ping"]
+  Admin["Admin browser<br/>?admin=ops"] --> AdminFlow["Kestra webhook<br/>admin_ops_snapshot"]
   AcceptFlow --> AcceptanceJSON["sentinel-acceptances.json"]
   LocationFlow --> HelpersJSON["sentinel-helpers.json"]
+  AdminFlow --> AdminJSON["sentinel-admin.json"]
   HelpersJSON --> UI["React tactical UI"]
   AcceptanceJSON --> UI
+  AdminJSON --> UI
   Intake -->|execution id| UI
   UI -->|poll every 1s| KestraAPI["/kestra-api/executions/{id}"]
   KestraAPI --> UI
@@ -51,6 +56,7 @@ flowchart TD
 - `flows/register_responder.yaml`: helper onboarding through Kestra, including cybercrime/security verification before SQLite upsert.
 - `flows/responder_location_ping.yaml`: responder live-location heartbeat into SQLite and the UI helper snapshot.
 - `flows/responder_accept_alert.yaml`: responder acceptance persistence into SQLite and the UI acceptance snapshot.
+- `flows/admin_ops_snapshot.yaml`: admin operational snapshot for responder integrity, accepted counts, recent acceptances, and incident-area analytics.
 
 ## Frontend Routes
 
@@ -58,6 +64,7 @@ flowchart TD
 - Helper onboarding: `http://127.0.0.1:5173/?onboard=helper`
 - Victim tracking page: `http://127.0.0.1:5173/?track=<responder_id>&execution=<execution_id>`
 - Responder console: `http://127.0.0.1:5173/?responder=<responder_id>&execution=<execution_id>`
+- Admin ops page: `http://127.0.0.1:5173/?admin=ops`
 
 ## Local Setup
 
@@ -100,7 +107,7 @@ Useful variables:
 
 ## Trusted Friend Notifications
 
-On the victim emergency page, add trusted friend emails in the Emergency Profile section, one per line. Every alert sends those contacts to Kestra in `trusted_contacts`. The `dispatch_trusted_contacts` task emails them with:
+On the victim emergency page, add trusted friend emails in the Emergency Profile section. Bulk entry supports commas, spaces, semicolons, or one email per line. Every alert sends those contacts to Kestra in `trusted_contacts`. The `dispatch_trusted_contacts` task emails them with:
 
 - emergency subject including victim name and approximate coordinates,
 - Google Maps location,

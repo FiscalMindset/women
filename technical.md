@@ -9,7 +9,7 @@ Sentinel Grid is designed as a real-time rescue coordination surface where the f
 | Layer | Responsibility |
 | --- | --- |
 | React frontend | Sensor capture, tactical UI, Kestra polling, responder/victim route rendering |
-| Kestra | Alert orchestration, responder verification, trusted-contact notification, location heartbeat, acceptance persistence, dispatch, report drafting |
+| Kestra | Alert orchestration, responder verification, trusted-contact notification, location heartbeat, acceptance persistence/counting, admin snapshots, dispatch, report drafting |
 | SQLite | Operational state for responders, acceptances, incident analytics |
 | Public UI snapshots | `sentinel-helpers.json` and `sentinel-acceptances.json` for browser polling |
 | Services scripts | Task code used by Kestra, not a backend feature API |
@@ -52,6 +52,7 @@ flowchart LR
   L --> DB2["SQLite responders"]
   A --> AJ["frontend/public/sentinel-acceptances.json"]
   L --> HJ["frontend/public/sentinel-helpers.json"]
+  A --> C["accepted_count + last_accepted_at"]
   AJ --> V["Victim tracking page"]
   HJ --> V
   HJ --> R
@@ -131,6 +132,7 @@ The tenant-aware `/main` segment is required. Without it, Kestra can return fals
 | Verified Nearby Responders | `nearest_helpers` output or `sentinel-helpers.json` |
 | Responder Console | URL query + Kestra execution + helper snapshot |
 | Real Kestra Topology | `taskRunList` and task output vars |
+| Admin Ops | `admin_ops_snapshot` and `sentinel-admin.json` |
 
 ## Data Model
 
@@ -154,6 +156,8 @@ erDiagram
     string location_updated_at
     string last_execution_id
     float last_location_accuracy_m
+    int accepted_count
+    string last_accepted_at
   }
 
   responder_acceptances {
@@ -179,6 +183,24 @@ erDiagram
 The victim profile stores trusted friend emails as local browser state. On every alert, the frontend sends that profile to Kestra. `normalize_payload` extracts valid email addresses into `trusted_contacts`, and `dispatch_trusted_contacts` sends a separate emergency email path before responder swarm delivery.
 
 This path is intentionally independent of nearest-responder matching. Even if no nearby verified responder is found, the user's saved trusted contacts still receive the emergency email when SMTP is configured.
+
+Bulk trusted-contact input supports commas, semicolons, whitespace, and new lines.
+
+## Admin Ops Endpoint
+
+The admin view uses:
+
+```text
+/?admin=ops
+```
+
+It triggers Kestra webhook:
+
+```text
+/kestra-admin-snapshot
+```
+
+That maps to flow `sentinel.grid.admin_ops_snapshot`, which writes `frontend/public/sentinel-admin.json`. The snapshot includes responder integrity, active/verified/flagged counts, accepted-count metrics, recent acceptances, incident rows, and hot-area analytics.
 
 ## Deployment Notes
 

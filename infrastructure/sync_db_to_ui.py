@@ -25,6 +25,8 @@ def _ensure_integrity_columns(conn: sqlite3.Connection) -> None:
         "location_updated_at": "ALTER TABLE responders ADD COLUMN location_updated_at TEXT",
         "last_execution_id": "ALTER TABLE responders ADD COLUMN last_execution_id TEXT",
         "last_location_accuracy_m": "ALTER TABLE responders ADD COLUMN last_location_accuracy_m REAL",
+        "accepted_count": "ALTER TABLE responders ADD COLUMN accepted_count INTEGER NOT NULL DEFAULT 0",
+        "last_accepted_at": "ALTER TABLE responders ADD COLUMN last_accepted_at TEXT",
     }
     for column, statement in migrations.items():
         if column not in existing:
@@ -41,7 +43,7 @@ def load_helpers(db_path: Path) -> list[dict[str, Any]]:
         SELECT id, telegram_chat_id, display_name, phone, email, github, photo_url,
                latitude, longitude, active, verification_status, cybercrime_status,
                cybercrime_checked_at, blacklist_reason, verification_source, location_updated_at,
-               last_execution_id, last_location_accuracy_m
+               last_execution_id, last_location_accuracy_m, accepted_count, last_accepted_at
         FROM responders
         ORDER BY active DESC, display_name COLLATE NOCASE
         """
